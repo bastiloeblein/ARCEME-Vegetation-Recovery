@@ -29,6 +29,8 @@ reports/            # Ignoriert alle HTML-Reports (Dokumentation)
 tb_logs/            # Ignoriert Tensorboard Logs
 wandb/              # Ignoriert Weights & Biases Logs
 #data_processing/data/WorldSeasons/*.tif # Ignoriert große Rasterdaten
+data_processing/data/WorldSeasons/
+data_processing/data/consolidated_s2_lc_analysis.csv
 
 # OS spezifisch
 .DS_Store
