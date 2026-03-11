@@ -1,0 +1,35 @@
+# Python System-Dateien
+__pycache__/
+*.so
+.Python
+env/
+build/
+develop-eggs/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Sicherheit & Konfiguration
+.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Datensatz & Reports (WICHTIG für dein Projekt)
+*.zarr/             # Ignoriert alle Zarr-Datenpakete
+reports/            # Ignoriert alle HTML-Reports (Dokumentation)
+tb_logs/            # Ignoriert Tensorboard Logs
+wandb/              # Ignoriert Weights & Biases Logs
+#data_processing/data/WorldSeasons/*.tif # Ignoriert große Rasterdaten
+
+# OS spezifisch
+.DS_Store
+Thumbs.db
