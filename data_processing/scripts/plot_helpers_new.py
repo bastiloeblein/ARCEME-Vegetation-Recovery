@@ -542,3 +542,43 @@ def plot_variable_analysis(
         plt.show()
 
     return ax
+
+def plot_variable_stats(ds, var_name, num_samples=5000):
+    """Plots mean, min and max of variable on subsample."""
+
+    # 1. Get vegetation mask
+    veg_mask = ds["is_veg"] == 1
+
+    # 2. Define vegetation coords
+    y_coords, x_coords = np.where(veg_mask.values)
+
+    # 3. Random sampling of vegetation pixels
+    num_to_sample = min(num_samples, len(x_coords))
+    indices = np.random.choice(len(x_coords), num_to_sample, replace=False)
+
+    chosen_x = x_coords[indices]
+    chosen_y = y_coords[indices]
+
+    sampled_data = ds[var_name].isel(
+        x=xr.DataArray(chosen_x, dims="sample"), 
+        y=xr.DataArray(chosen_y, dims="sample")
+    )
+    
+    # 2. Stats over time axis
+    mean_val = sampled_data.mean(dim="sample", skipna=True)
+    max_val = sampled_data.max(dim="sample", skipna=True)
+    min_val = sampled_data.min(dim="sample", skipna=True)
+
+    # 3. Plot
+    fig = plt.figure(figsize=(10, 4))
+    plt.plot(mean_val.values, label="Mean", color="green", lw=2)
+    plt.fill_between(range(len(mean_val)), min_val.values, max_val.values, 
+                     color="green", alpha=0.2, label="Min-Max Range")
+    
+    plt.title(f"Temporal Statistics: {var_name}")
+    plt.xlabel("Timestep")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    return fig

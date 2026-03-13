@@ -12,6 +12,7 @@ from data_processing.scripts.plot_helpers_new import (
     plot_rgb,
     plot_nan_distribution,
     plot_spatial_nan_frequency,
+    plot_variable_stats
 )
 from data_processing.scripts.interpolation import (
     trim_to_first_s2_acquisition,
@@ -106,12 +107,17 @@ if __name__ == "__main__":
     # 1. Define data directories
     S3_BASE_URL = os.getenv("S3_BASE_URL")
     BUCKET_NAME = os.getenv("BUCKET_NAME")
-    CUBE_DIR = os.getenv("OUTPUT_DIR")
+    SPLIT = "train"
+    CUBE_DIR = os.path.join(os.getenv("OUTPUT_DIR"), SPLIT)
     S3_ENDPOINT = os.getenv("S3_ENDPOINT")
     OUTPUT_DIR = os.path.join(CUBE_DIR, "postprocessed")
     INFO_DIR = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "..", "reports"
+        os.path.dirname(os.path.abspath(__file__)), "..", "reports/final_cube_info"
     )
+
+    # Create dir if doesnt exist yet
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
 
     # Initialize stats dict for nan reduction calculation
     all_cubes_stats = {}
@@ -150,6 +156,7 @@ if __name__ == "__main__":
         "tp_dailymean_mean",
         "tp_rollingmax_mean",
     ]
+    SPATIO_TEMPORAL_VARS = S1_VARS + S2_VARS
 
     fs = s3fs.S3FileSystem(anon=True, client_kwargs={"endpoint_url": S3_ENDPOINT})
 
@@ -173,7 +180,7 @@ if __name__ == "__main__":
         print(f"Processing {cube_id}")
 
         # Create postprocessing file in processing_info/{cube_id}
-        info_dir = os.path.join(INFO_DIR, cube_id)
+        info_dir = os.path.join(INFO_DIR,  SPLIT, cube_id)
 
         try:
 
@@ -306,14 +313,47 @@ if __name__ == "__main__":
                 fig = plot_spatial_nan_frequency(ds, var, ds.attrs["precip_end_date"])
                 save_plot_to_report(fig, report_sequence, stdout_buffer)
 
-            #  6. ERA5 plots
+            #  6. Plots over time
+            #  6.1 ERA5
             print("Visual analysis of ERA5 variables")
-            for var in ERA5_VARS:
-                print("#" * 10, {var}, "#" * 10)
-                fig = plt.figure(figsize=(8, 6))
-                ds[var].plot()
-                plt.title(f"Variable: {var}")
+            for var_mean in ERA5_VARS:
+                print("#" * 10, {var_mean}, "#" * 10)
+                base_name = var_mean.replace("_mean", "")
+                var_min = f"{base_name}_min"
+                var_max = f"{base_name}_max"
+
+                fig = plt.figure(figsize=(10, 5))
+    
+                # 1. Zeitachse extrahieren
+                time_axis = ds["time_sentinel_2_l2a"].values
+                
+                # 2. Den Mean plotten (die Hauptlinie)
+                plt.plot(time_axis, ds[var_mean].values, label="Mean", color="blue", lw=2, zorder=3)
+                
+                # 3. Min und Max hinzufügen, falls sie im Dataset existieren
+                if var_min in ds and var_max in ds:
+                    # Die Kurven für Min und Max
+                    plt.plot(time_axis, ds[var_max].values, color="red", alpha=0.3, ls='--', label="Max")
+                    plt.plot(time_axis, ds[var_min].values, color="cyan", alpha=0.3, ls='--', label="Min")
+                    
+                    # Den Bereich dazwischen füllen für bessere Sichtbarkeit
+                    plt.fill_between(time_axis, 
+                                     ds[var_min].values, 
+                                     ds[var_max].values, 
+                                     color="gray", alpha=0.1, label="Range (Min-Max)")
+                
+                # fig = plt.figure(figsize=(8, 6))
+                # ds[var].plot()
+                # plt.title(f"Variable: {var}")
                 save_plot_to_report(fig, report_sequence, stdout_buffer)
+
+            # 6.2 Remaining Spatio-temporal vars
+            print("Visual analysis of spatio-temporal variables")
+            for var in SPATIO_TEMPORAL_VARS:
+                if var in ds:
+                    print("#" * 10, {var}, "#" * 10)
+                    fig = plot_variable_stats(ds, var)
+                    save_plot_to_report(fig, report_sequence, stdout_buffer)
 
             #  7. Interpolation & before/after comparison
             print("\n--- Interpolation Analysis ---")

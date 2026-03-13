@@ -206,8 +206,7 @@ def run_processing_pipeline(
     cube_keys = list(cubes.keys())
     for n, key in enumerate(cube_keys):
         # Get cube and split
-        ds = cubes.pop(key)
-        split = ds.attrs["split"]
+        split = cubes[key].attrs["split"]
 
         # Define save_path
         target_dir = train_dir if split == "train" else test_dir
@@ -219,6 +218,7 @@ def run_processing_pipeline(
             cubes.pop(key)
             continue
 
+        ds = cubes.pop(key)
         cube_id = key
 
         info_dir = os.path.join(info_base, split, cube_id)
@@ -545,7 +545,7 @@ if __name__ == "__main__":
 
     # 2. LOAD & FILTER METADATA (CSV)
     print("Loading and filtering metadata...")
-    df_data = pd.read_csv("data/train_test_split.csv", sep=",")
+    df_data = pd.read_csv("data_processing/data/train_test_split.csv", sep=",")
 
     train_ids = df_data[df_data["split"] == "train"]["DisNo."].unique().tolist()
     test_ids = df_data[df_data["split"] == "test"]["DisNo."].unique().tolist()
