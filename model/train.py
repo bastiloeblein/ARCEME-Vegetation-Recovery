@@ -3,6 +3,7 @@ import torch
 import os
 import random
 import json
+import sys
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -10,8 +11,19 @@ import pytorch_lightning as L
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+    print("Starting from:", ROOT_DIR)
+
+
 from model.ConvLSTM_model import ConvLSTM_Model
-from model.dataset import ARCEME_Dataset, get_llto_splits, get_llto_splits_strict, get_val_tiles_auto
+from model.dataset import (
+    ARCEME_Dataset,
+    get_llto_splits,
+    get_val_tiles_auto,
+)
 from model.utils import print_channel_info, get_cloud_stats_zarr
 
 # --- Reproducibility ---
@@ -20,6 +32,7 @@ L.seed_everything(42, workers=True)
 torch.set_float32_matmul_precision("medium")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+
 # Set DataLoader worker seed for reproducibility
 # -> numpy/random are deterministic
 def seed_worker(worker_id):
@@ -27,9 +40,9 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
+
 # --- Load Config ---
 MODEL_DIR = Path(__file__).resolve().parent
-ROOT_DIR = MODEL_DIR.parent
 
 with open(MODEL_DIR / "config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
@@ -78,8 +91,8 @@ with open(config_log_path, "w") as f:
 print(f"✅ Config saved: {config_log_path}")
 
 # --- Create CV Splits ---
-# all_folds = get_llto_splits(PROCESSED_DIR, CSV_PATH, k=K_FOLDS, show=True)
-all_folds = get_llto_splits_strict(PROCESSED_DIR, CSV_PATH, k=K_FOLDS, show=True, save_path=RUN_DIR) 
+all_folds = get_llto_splits(PROCESSED_DIR, CSV_PATH, k=K_FOLDS, show=True)
+# all_folds = get_llto_splits_strict(PROCESSED_DIR, CSV_PATH, k=K_FOLDS, show=True, save_path=RUN_DIR)
 
 # --- Log Split Info ---
 split_info = {}
@@ -108,7 +121,7 @@ for fold_idx, (train_files, val_files) in enumerate(all_folds):
     print("📊 Scanning Cloud Cover (Zarr)...")
     train_clouds = get_cloud_stats_zarr(train_files)
     val_clouds = get_cloud_stats_zarr(val_files)
-    
+
     print(f"☁️ Training Clouds:   {train_clouds:.2f}%")
     print(f"☁️ Validation Clouds: {val_clouds:.2f}%")
 
@@ -153,12 +166,9 @@ for fold_idx, (train_files, val_files) in enumerate(all_folds):
         num_workers=4,
         worker_init_fn=seed_worker,
         generator=g,  # can be deleted
-    ) 
+    )
     val_loader = torch.utils.data.DataLoader(
-        val_ds, 
-        batch_size=cfg["training"]["batch_size"], 
-        shuffle=False, 
-        num_workers=4
+        val_ds, batch_size=cfg["training"]["batch_size"], shuffle=False, num_workers=4
     )
 
     # Model intialization
@@ -167,13 +177,17 @@ for fold_idx, (train_files, val_files) in enumerate(all_folds):
     model.fold_idx = fold_idx
 
     # Logger & Callbacks (Saves best model of a fold)
-    logger = TensorBoardLogger(RUN_DIR, name=f"fold_{fold_idx}", default_hp_metric=False)
-    
-    # Log Split + Config also in TensorBoard 
+    logger = TensorBoardLogger(
+        RUN_DIR, name=f"fold_{fold_idx}", default_hp_metric=False
+    )
+
+    # Log Split + Config also in TensorBoard
     logger.experiment.add_text(
         "split_info",
-        f"**Train files ({len(train_files)}):**\n" + "\n".join([f"- {f}" for f in train_files]) +
-        f"\n\n**Val files ({len(val_files)}):**\n" + "\n".join([f"- {f}" for f in val_files]),
+        f"**Train files ({len(train_files)}):**\n"
+        + "\n".join([f"- {f}" for f in train_files])
+        + f"\n\n**Val files ({len(val_files)}):**\n"
+        + "\n".join([f"- {f}" for f in val_files]),
         global_step=0,
     )
     logger.experiment.add_text(
@@ -181,7 +195,7 @@ for fold_idx, (train_files, val_files) in enumerate(all_folds):
         f"```yaml\n{yaml.dump(cfg)}\n```",
         global_step=0,
     )
-    
+
     # Only save the best model of each fold based on validation loss
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(RUN_DIR, f"fold_{fold_idx}", "checkpoints"),
@@ -189,15 +203,17 @@ for fold_idx, (train_files, val_files) in enumerate(all_folds):
         filename="best-model-epoch={epoch:02d}-val_loss={val_loss:.4f}",
         save_top_k=1,
         mode="min",
+        auto_insert_metric_name=False,
     )
     # Early stopping if validation loss doesn't improve for 10 epochs
-    early_stop = EarlyStopping(monitor="val_loss", patience=10, mode="min")
+    early_stop = EarlyStopping(monitor="val_loss", patience=25, mode="min")
 
     # Trainer
     trainer = Trainer(
-        accumulate_grad_batches=8, # Simuliert Batch Size 32 bei realer BS 4
+        accumulate_grad_batches=8,  # Simuliert Batch Size 32 bei realer BS 4
         log_every_n_steps=1,
         check_val_every_n_epoch=1,
+        # overfit_batches=1,   # OVERFIT
         max_epochs=cfg["training"]["max_epochs"],
         accelerator=cfg["training"]["accelerator"],
         devices=cfg["training"]["devices"],
@@ -211,7 +227,11 @@ for fold_idx, (train_files, val_files) in enumerate(all_folds):
     trainer.fit(model, train_loader, val_loader)
 
     # --- Collect fold results for final summary ---
-    best_val_loss = checkpoint_callback.best_model_score.item() if checkpoint_callback.best_model_score else float("nan")
+    best_val_loss = (
+        checkpoint_callback.best_model_score.item()
+        if checkpoint_callback.best_model_score
+        else float("nan")
+    )
     best_epoch = trainer.current_epoch
     best_ckpt = checkpoint_callback.best_model_path
 
@@ -223,7 +243,9 @@ for fold_idx, (train_files, val_files) in enumerate(all_folds):
         "val_files": [str(f) for f in val_files],
     }
     fold_results.append(fold_result)
-    print(f"\n✅ Fold {fold_idx} done | Best Val Loss: {best_val_loss:.4f} | Checkpoint: {best_ckpt}")
+    print(
+        f"\n✅ Fold {fold_idx} done | Best Val Loss: {best_val_loss:.4f} | Checkpoint: {best_ckpt}"
+    )
 
 # --- Final Summary ---
 summary = {
@@ -239,9 +261,12 @@ with open(summary_path, "w") as f:
 
 print("\n" + "=" * 50)
 print("🏁 CROSS-VALIDATION COMPLETE")
-print(f"   Mean Val Loss: {summary['mean_val_loss']:.4f} ± {summary['std_val_loss']:.4f}")
-print(f"   Best Fold:     {summary['best_fold']['fold']} (Val Loss: {summary['best_fold']['best_val_loss']:.4f})")
+print(
+    f"   Mean Val Loss: {summary['mean_val_loss']:.4f} ± {summary['std_val_loss']:.4f}"
+)
+print(
+    f"   Best Fold:     {summary['best_fold']['fold']} (Val Loss: {summary['best_fold']['best_val_loss']:.4f})"
+)
 print(f"   Best Model:    {summary['best_fold']['best_checkpoint']}")
 print(f"   Summary:       {summary_path}")
 print("=" * 50)
-

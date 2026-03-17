@@ -12,7 +12,7 @@ from data_processing.scripts.plot_helpers_new import (
     plot_rgb,
     plot_nan_distribution,
     plot_spatial_nan_frequency,
-    plot_variable_stats
+    plot_variable_stats,
 )
 from data_processing.scripts.interpolation import (
     trim_to_first_s2_acquisition,
@@ -180,7 +180,7 @@ if __name__ == "__main__":
         print(f"Processing {cube_id}")
 
         # Create postprocessing file in processing_info/{cube_id}
-        info_dir = os.path.join(INFO_DIR,  SPLIT, cube_id)
+        info_dir = os.path.join(INFO_DIR, SPLIT, cube_id)
 
         try:
 
@@ -323,37 +323,53 @@ if __name__ == "__main__":
                 var_max = f"{base_name}_max"
 
                 fig = plt.figure(figsize=(10, 5))
-    
-                # 1. Zeitachse extrahieren
+
+                # 1. Extract time axis
                 time_axis = ds["time_sentinel_2_l2a"].values
-                
-                # 2. Den Mean plotten (die Hauptlinie)
-                plt.plot(time_axis, ds[var_mean].values, label="Mean", color="blue", lw=2, zorder=3)
-                
-                # 3. Min und Max hinzufügen, falls sie im Dataset existieren
+
+                # 2. Plot mean
+                plt.plot(
+                    time_axis,
+                    ds[var_mean].values,
+                    label="Mean",
+                    color="blue",
+                    lw=2,
+                    zorder=3,
+                )
+
+                # 3. Add min and max
                 if var_min in ds and var_max in ds:
-                    # Die Kurven für Min und Max
-                    plt.plot(time_axis, ds[var_max].values, color="red", alpha=0.3, ls='--', label="Max")
-                    plt.plot(time_axis, ds[var_min].values, color="cyan", alpha=0.3, ls='--', label="Min")
-                    
-                    # Den Bereich dazwischen füllen für bessere Sichtbarkeit
-                    plt.fill_between(time_axis, 
-                                     ds[var_min].values, 
-                                     ds[var_max].values, 
-                                     color="gray", alpha=0.1, label="Range (Min-Max)")
-                
+                    plt.plot(
+                        time_axis,
+                        ds[var_max].values,
+                        color="red",
+                        alpha=0.3,
+                        ls="--",
+                        label="Max",
+                    )
+                    plt.plot(
+                        time_axis,
+                        ds[var_min].values,
+                        color="cyan",
+                        alpha=0.3,
+                        ls="--",
+                        label="Min",
+                    )
+
+                    # fill area inbetween
+                    plt.fill_between(
+                        time_axis,
+                        ds[var_min].values,
+                        ds[var_max].values,
+                        color="gray",
+                        alpha=0.1,
+                        label="Range (Min-Max)",
+                    )
+
                 # fig = plt.figure(figsize=(8, 6))
                 # ds[var].plot()
                 # plt.title(f"Variable: {var}")
                 save_plot_to_report(fig, report_sequence, stdout_buffer)
-
-            # 6.2 Remaining Spatio-temporal vars
-            print("Visual analysis of spatio-temporal variables")
-            for var in SPATIO_TEMPORAL_VARS:
-                if var in ds:
-                    print("#" * 10, {var}, "#" * 10)
-                    fig = plot_variable_stats(ds, var)
-                    save_plot_to_report(fig, report_sequence, stdout_buffer)
 
             #  7. Interpolation & before/after comparison
             print("\n--- Interpolation Analysis ---")
@@ -441,6 +457,14 @@ if __name__ == "__main__":
             # Create final masks
             ds_final = create_final_binary_masks(ds_intp)
 
+            # 6.2 Remaining Spatio-temporal vars
+            print("Visual analysis of spatio-temporal variables")
+            for var in SPATIO_TEMPORAL_VARS:
+                if var in ds_final:
+                    print("#" * 10, {var}, "#" * 10)
+                    fig = plot_variable_stats(ds, var)
+                    save_plot_to_report(fig, report_sequence, stdout_buffer)
+
             # ----- EXPORT ----
             # Assure variable dtypes
             uint8_vars = ["ESA_LC", "is_veg", "mask_s1", "mask_s2", "target_mask"]
@@ -466,6 +490,8 @@ if __name__ == "__main__":
             for var in ds_final.data_vars:
 
                 # Define chunks
+                ds_final[var].encoding = {}
+
                 var_dims = ds_final[var].dims
                 safe_chunks_tuple = tuple(
                     target_chunks[d] for d in var_dims if d in target_chunks
@@ -489,6 +515,21 @@ if __name__ == "__main__":
                 save_path, mode="w", consolidated=True, encoding=final_encoding
             )
             print(f"✅ SUCCESS: Postprocessed cube saved to {save_path}")
+
+            # --- DELETE SOURCE CUBE ---
+            source_cube_path = os.path.join(CUBE_DIR, cube_name)
+            try:
+                import shutil
+
+                if os.path.exists(save_path):
+                    shutil.rmtree(source_cube_path)
+                    print(f"🗑️ DELETED source cube to free space: {source_cube_path}")
+                else:
+                    print(
+                        f"⚠️ Warning: Save path {save_path} not found. Source NOT deleted."
+                    )
+            except Exception as e_del:
+                print(f"❌ Failed to delete source cube {source_cube_path}: {e_del}")
 
         except Exception as e:
             print(f"\nERROR: {str(e)}")

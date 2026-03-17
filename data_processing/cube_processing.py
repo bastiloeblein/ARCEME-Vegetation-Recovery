@@ -609,7 +609,7 @@ if __name__ == "__main__":
     print("Global vh max: ", global_vh_max)
 
     # 5.2 ERA5 Stats
-    era5_stats_path = os.path.join(BASE_OUTPUT_DIR, "global_era5_stats.json")
+    era5_stats_path = os.path.join(BASE_OUTPUT_DIR, "era5", "global_era5_stats.json")
     # Load ERA5 Cubes (PEI, T2m, TP)
     era5_cubes = [
         xr.open_zarr(os.path.join(ERA5_PATH, name), consolidated=False)
