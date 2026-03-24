@@ -207,18 +207,21 @@ if __name__ == "__main__":
             if indices:
                 selected_idx = indices[0]
                 is_fallback = False
+                if not indices_rgb:
+                    indices_rgb = [selected_idx]
             else:
                 print("⚠️ No cloud-free indices found via find_good_indices.")
                 # Fallback: Selected timestep with fewest NaNs
                 nan_counts_s2 = ds["kNDVI"].isnull().sum(dim=["x", "y"]).compute()
                 selected_idx = int(nan_counts_s2.argmin())
-                nan_percent = (
-                    nan_counts_s2[selected_idx] / (ds.x.size * ds.y.size) * 100
-                ).values
+                nan_percent = nan_counts_s2[selected_idx].item() / (
+                    ds.x.size * ds.y.size
+                )
                 print(
                     f"Selecting fallback index {selected_idx} (minimal NaNs in kNDVI: {nan_percent:.2%})"
                 )
                 is_fallback = True
+                indices_rgb = [selected_idx]
 
             # Jetzt für alle Variablen diesen Index plotten
             for var in S2_VARS:
@@ -462,7 +465,7 @@ if __name__ == "__main__":
             for var in SPATIO_TEMPORAL_VARS:
                 if var in ds_final:
                     print("#" * 10, {var}, "#" * 10)
-                    fig = plot_variable_stats(ds, var)
+                    fig = plot_variable_stats(ds_final, var)
                     save_plot_to_report(fig, report_sequence, stdout_buffer)
 
             # ----- EXPORT ----
