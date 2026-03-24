@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import seaborn as sns
 import random
+import re
 
 
 class ARCEME_Dataset(Dataset):
@@ -24,6 +25,7 @@ class ARCEME_Dataset(Dataset):
         target_length,
         patch_size,
         train,
+        exclude_file=None,
         s2_vars=None,
         s1_vars=None,
         era5_vars=None,
@@ -47,7 +49,7 @@ class ARCEME_Dataset(Dataset):
             fixed_tiles (list, optional): Spatial offsets for validation tiling.
             use_augmentation (bool): Whether to apply data augmentation.
         """
-        self.cube_paths = cube_paths
+        self.cube_paths = self._filter_cube_paths(cube_paths, exclude_file)
         self.context_len = context_length
         self.target_len = target_length
         self.patch_size = patch_size
@@ -158,6 +160,42 @@ class ARCEME_Dataset(Dataset):
                 f"but got {actual_target_start}. Path: {path}"
             )
 
+    def _filter_cube_paths(self, cube_paths, exclude_file):
+        """
+        Filters the list of cube paths based on an exclusion file or list.
+        """
+        pattern = r"2\d{3}-\d{4}-[A-Z]{3}"
+        excluded_ids = set()
+
+        # 1. Load excluded IDs from file or list
+        if exclude_file is not None:
+            if isinstance(exclude_file, str) and exclude_file.endswith(".csv"):
+                df_ex = pd.read_csv(exclude_file)
+                if "cube_id" in df_ex.columns:
+                    excluded_ids = set(
+                        df_ex["cube_id"].astype(str).str.strip().tolist()
+                    )
+            elif isinstance(exclude_file, list):
+                excluded_ids = set([str(i).strip() for i in exclude_file])
+
+        if not excluded_ids:
+            return cube_paths
+
+        # Filter
+        filtered_paths = []
+        for path in cube_paths:
+            match = re.search(pattern, path)
+            if match:
+                cube_id = match.group(0)
+                if cube_id not in excluded_ids:
+                    filtered_paths.append(path)
+            else:
+                pass
+
+        print(f"Filter applied: {len(cube_paths)} -> {len(filtered_paths)} Cubes.")
+
+        return filtered_paths
+
     def __getitem__(self, idx):
         """
         Loads and processes a single data sample.
@@ -167,6 +205,7 @@ class ARCEME_Dataset(Dataset):
         """
         # All cubes are 1000 x 1000 pixel
         h, w = 1000, 1000
+        pattern = r"2\d{3}-\d{4}-[A-Z]{3}"
 
         # ======================================================================
         # 1. PATCHING STRATEGY
@@ -191,6 +230,13 @@ class ARCEME_Dataset(Dataset):
             ds = xr.open_zarr(path, consolidated=True)
         except Exception:
             ds = xr.open_zarr(path, consolidated=False)
+
+        # Get cube_id
+        match = re.search(pattern, path)
+        if match:
+            cube_id = match.group(0)
+        else:
+            cube_id = "No_ID_Found"
 
         # Select spatial patch: (time, y, x)
         ds = ds.isel(
@@ -262,11 +308,15 @@ class ARCEME_Dataset(Dataset):
 
         # x_era5_1d: (C_era5, T_ctx) -> Broadcasted: (C_era5, T_ctx, H, W)
         if len(self.era5_vars) > 0:
-            x_era5_1d = torch.from_numpy(ds_ctx[self.era5_vars].to_array().values).float()
+            x_era5_1d = torch.from_numpy(
+                ds_ctx[self.era5_vars].to_array().values
+            ).float()
             x_era5 = broadcast_era5(x_era5_1d, self.patch_size, self.patch_size)
         else:
             # Erzeuge einen leeren Tensor mit 0 Kanälen, aber passenden anderen Dimensionen
-            x_era5 = torch.empty((0, self.context_len, self.patch_size, self.patch_size))
+            x_era5 = torch.empty(
+                (0, self.context_len, self.patch_size, self.patch_size)
+            )
         self._check_shape(
             x_era5,
             (len(self.era5_vars), self.context_len, self.patch_size, self.patch_size),
@@ -315,9 +365,13 @@ class ARCEME_Dataset(Dataset):
 
         # x_stat_raw: (C_stat, T_ctx, H, W)
         if len(self.static_vars) > 0:
-            x_stat_raw = torch.from_numpy(ds_ctx[self.static_vars].to_array().values).float()
+            x_stat_raw = torch.from_numpy(
+                ds_ctx[self.static_vars].to_array().values
+            ).float()
         else:
-            x_stat_raw = torch.empty((0, self.context_len, self.patch_size, self.patch_size))
+            x_stat_raw = torch.empty(
+                (0, self.context_len, self.patch_size, self.patch_size)
+            )
         self._check_shape(
             x_stat_raw,
             (len(self.static_vars), self.context_len, self.patch_size, self.patch_size),
@@ -366,7 +420,9 @@ class ARCEME_Dataset(Dataset):
         # ======================================================================
         # Climate (ERA5) -> x_fut_era5_1d: (C_era5, T_target) -> x_fut_era5: (C_era5, T_target, H, W)
         if len(self.era5_vars) > 0:
-            x_fut_era5_1d = torch.from_numpy(ds_target[self.era5_vars].to_array().values).float()
+            x_fut_era5_1d = torch.from_numpy(
+                ds_target[self.era5_vars].to_array().values
+            ).float()
             self._check_shape(
                 x_fut_era5_1d,
                 (len(self.era5_vars), self.target_len),
@@ -375,7 +431,9 @@ class ARCEME_Dataset(Dataset):
             )
             x_fut_era5 = broadcast_era5(x_fut_era5_1d, self.patch_size, self.patch_size)
         else:
-            x_fut_era5 = torch.empty((0, self.target_len, self.patch_size, self.patch_size))
+            x_fut_era5 = torch.empty(
+                (0, self.target_len, self.patch_size, self.patch_size)
+            )
         self._check_shape(
             x_fut_era5,
             (len(self.era5_vars), self.target_len, self.patch_size, self.patch_size),
@@ -389,9 +447,13 @@ class ARCEME_Dataset(Dataset):
             1, 0, 2, 3
         )  # (12, T_target, H, W)
         if len(self.static_vars) > 0:
-            x_stat_fut = torch.from_numpy(ds_target[self.static_vars].to_array().values).float()
+            x_stat_fut = torch.from_numpy(
+                ds_target[self.static_vars].to_array().values
+            ).float()
         else:
-            x_stat_fut = torch.empty((0, self.target_len, self.patch_size, self.patch_size))
+            x_stat_fut = torch.empty(
+                (0, self.target_len, self.patch_size, self.patch_size)
+            )
 
         # Combine to x_future_feat: (T_target, C_fut, H, W)
         # Concatenate: Climate (C_era5) + ESA One-Hot (12) + Statics (2)
@@ -487,7 +549,7 @@ class ARCEME_Dataset(Dataset):
         ds.close()
 
         # Save tiles
-        meta = {"top": top, "left": left, "path": path}
+        meta = {"top": top, "left": left, "path": path, "cube_id": cube_id}
 
         return x_context, x_future_feat, y_target, target_mask, meta, baseline_sample
 
@@ -572,7 +634,12 @@ def get_llto_splits(root_dir, csv_path="train_test_split.csv", k=3, show=False):
 
 
 def get_llto_splits_strict(
-    root_dir, csv_path="train_test_split.csv", k=3, min_val_ratio=0.15, show=False, save_path=None
+    root_dir,
+    csv_path="train_test_split.csv",
+    k=3,
+    min_val_ratio=0.15,
+    show=False,
+    save_path=None,
 ):
     """
     Implements LLTO-CV ensuring a minimum validation size while reporting data usage.
@@ -724,9 +791,8 @@ def _plot_llto_strategy(vis_matrix, groups, k, save_path=None):
         print(f"✅ CV Split Plot gespeichert: {out_path}")
     else:
         plt.show()
-        
-    plt.close()
 
+    plt.close()
 
 
 def broadcast_era5(era5_tensor, target_h, target_w):
