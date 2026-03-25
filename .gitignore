@@ -19,6 +19,7 @@ wheels/
 
 # Sicherheit & Konfiguration
 .env
+wanddb.txt
 
 # Jupyter Notebooks
 .ipynb_checkpoints/
