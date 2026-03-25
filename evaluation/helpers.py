@@ -63,10 +63,14 @@ def plot_comparison(data, metrics):
 
             # Data for this timestep
             y_t = np.ma.masked_where(curr_mask, true[t])
-            y_p = np.ma.masked_where(curr_mask, pred[t])
             d_t = np.ma.masked_where(curr_mask, true[t] - baseline)
-            d_p = np.ma.masked_where(curr_mask, pred[t] - baseline)
+            # y_p = np.ma.masked_where(curr_mask, pred[t])
+            # d_p = np.ma.masked_where(curr_mask, pred[t] - baseline)
             err = np.ma.masked_where(curr_mask, true[t] - pred[t])
+
+            # Prediction should not be masked
+            y_p = pred[t]
+            d_p = pred[t] - baseline
 
             # Row 0: Ground Truth
             axes[0, i].imshow(y_t, vmin=0, vmax=0.8, cmap="Greens")

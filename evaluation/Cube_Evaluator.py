@@ -261,14 +261,22 @@ class CubeEvaluator:
                 f"{m['bias_delta']:>9.4f} | {num_v:>7} ({pct:>3.1f}%) {mark}"
             )
 
-        # Aggregation
-        avg_p = np.mean(valid_mses_p) if valid_mses_p else 0.0
-        avg_b = np.mean(valid_mses_b) if valid_mses_b else 0.0
-        avg_bias = np.mean(valid_biases) if valid_biases else 0.0
-
-        total_pct = (total_valid_pixels / ((p_size**2) * len(metrics))) * 100
-
+        # Aggregation (weighted by number of valid pixels)
         if total_valid_pixels > 0:
+            # Multiply each mse with valid pixels and sum all, then divide by total number of valid pixels over all timesteps
+            avg_p = (
+                sum(m["mse_pred"] * m["num_valid"] for m in metrics)
+                / total_valid_pixels
+            )
+            avg_b = (
+                sum(m["mse_base"] * m["num_valid"] for m in metrics)
+                / total_valid_pixels
+            )
+            avg_bias = (
+                sum(m["bias_delta"] * m["num_valid"] for m in metrics)
+                / total_valid_pixels
+            )
+
             total_better = avg_p < avg_b
             res_msg = (
                 f"{GREEN}✅ MODEL WINS{RESET}"
@@ -277,7 +285,10 @@ class CubeEvaluator:
             )
             sum_color = GREEN if total_better else RED
         else:
+            avg_p = avg_b = avg_bias = 0.0
             res_msg, sum_color = "⚪ NO DATA", RESET
+
+        total_pct = (total_valid_pixels / ((p_size**2) * len(metrics))) * 100
 
         print("-" * len(header))
         print(

@@ -32,6 +32,9 @@ wandb/              # Ignoriert Weights & Biases Logs
 data_processing/data/WorldSeasons/
 data_processing/data/consolidated_s2_lc_analysis.csv
 model/tb_logs
+model/new_logs
+plots/
+notebooks/02_Model_Specific/evaluation_plots/
 
 # OS spezifisch
 .DS_Store
