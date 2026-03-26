@@ -17,9 +17,12 @@ class ConvLSTMCell(nn.Module):
         self.input_dim = (
             input_dim  # number of channels (variables) of input (per pixel)
         )
-        self.hidden_dim = hidden_dim  # memory-like: to each pixel it has saved hidden_dim information (it is usually double the input_dim
-        self.kernel_size = kernel_size  # Always looks at a pixel and the 8 neighbouring pixles (3 x 3) kernel (usually 3 or 5)
-        self.dilation = dilation  # 1
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+
+        self.hidden_h_param = nn.Parameter(torch.zeros(1, hidden_dim, 1, 1))
+        self.hidden_c_param = nn.Parameter(torch.zeros(1, hidden_dim, 1, 1))
 
         self.conv = nn.Conv2d(
             in_channels=self.input_dim
@@ -28,11 +31,14 @@ class ConvLSTMCell(nn.Module):
             * self.hidden_dim,  # 4 output channels: for the 4 gates (input, forget, cell and output)
             kernel_size=self.kernel_size,
             padding="same",
+            padding_mode="reflect",
             dilation=self.dilation,
             bias=True,  # Adds learnable bias to the output
         )
 
-    def forward(self, input_tensor, cur_state):  # is calles once for each timestep
+        self._init_weights()
+
+    def forward(self, input_tensor, cur_state):
         """
         input_tensor Shape: (Batch, Channels, Height, Width) -> (B, 34, 256, 256)
         cur_state: Tuple of (h_cur, c_cur), both have shape:    (B, 64, 256, 256)
@@ -83,26 +89,25 @@ class ConvLSTMCell(nn.Module):
 
         return h_next, c_next
 
+    def _init_weights(self):
+        # nn.init.kaiming_normal_(self.conv.weight, nonlinearity='relu')
+        nn.init.xavier_normal_(self.conv.weight)
+        if self.conv.bias is not None:
+            h = self.hidden_dim
+            self.conv.bias.data.fill_(0)
+            self.conv.bias.data[h : 2 * h].fill_(
+                1.0
+            )  # set bias of forget gate to 1.0 -> at beginning model keeps information
+
     def init_hidden(self, batch_size, height, width):
-        return (
-            torch.zeros(
-                batch_size,
-                self.hidden_dim,
-                height,
-                width,
-                device=self.conv.weight.device,
-            ),
-            torch.zeros(
-                batch_size,
-                self.hidden_dim,
-                height,
-                width,
-                device=self.conv.weight.device,
-            ),
-        )
+
+        h_start = self.hidden_h_param.expand(batch_size, -1, height, width)
+        c_start = self.hidden_c_param.expand(batch_size, -1, height, width)
+
+        return h_start, c_start
 
 
-class ConvLSTM(nn.Module):
+class SGEDConvLSTM(nn.Module):
     def __init__(
         self,
         input_dim,
@@ -113,16 +118,19 @@ class ConvLSTM(nn.Module):
         dilation,
         num_layers,
         baseline="last_frame",
+        dropout_prob=0.0,
     ):
         """
         input_dim: Channels in context tensor (z.B. 34)
         decoder_input_dim: Channel in future (for prediction) (z.B. 25: 1 Pred + Climate + Statics)
         """
-        super(ConvLSTM, self).__init__()
+        super(SGEDConvLSTM, self).__init__()
 
         # --- Safety ---
         if not isinstance(hidden_dims, list) or len(hidden_dims) != num_layers:
-            raise ValueError(f"hidden_dims muss eine Liste der Länge num_layers ({num_layers}) sein.")
+            raise ValueError(
+                f"hidden_dims muss eine Liste der Länge num_layers ({num_layers}) sein."
+            )
 
         self._check_kernel_size_consistency(kernel_size)
         self.input_dim = input_dim
@@ -131,6 +139,13 @@ class ConvLSTM(nn.Module):
         self.kernel_size = kernel_size
         self.num_layers = num_layers
         self.baseline = baseline
+
+        self.dropout_prob = dropout_prob
+
+        # Dropout layers for all but the last layer (no information drop right before predition)
+        self.dropout_layers = nn.ModuleList(
+            [nn.Dropout2d(p=self.dropout_prob) for _ in range(self.num_layers - 1)]
+        )
 
         # ENCODER LAYERS (für die Vergangenheit)
         self.encoder_cells = nn.ModuleList()
@@ -152,7 +167,7 @@ class ConvLSTM(nn.Module):
         self.predict_layer = nn.Conv2d(
             in_channels=hidden_dims[-1],  # Die channels from previous hidden state
             out_channels=output_dim,  # 1 channel for kNDVI
-            kernel_size=1,  # 1x1 bedeutet: schaue nur auf den Pixel selbst
+            kernel_size=1,
         )
 
     def forward(self, input_tensor, prediction_count, non_pred_feat, baseline_sample):
@@ -163,13 +178,15 @@ class ConvLSTM(nn.Module):
         baseline_sample:                            -> Baseline (last_frame)
         """
 
-        # --- ABSICHERUNG ---
+        # --- SAFETY ---
         # input_tensor: (B, T_ctx, C, H, W)
         if input_tensor.dim() != 5:
             raise ValueError(f"Input Tensor muss 5D sein, got {input_tensor.dim()}D")
         if non_pred_feat.size(1) != prediction_count:
-            raise ValueError(f"Nicht genug Wetterdaten! Prediction braucht {prediction_count} Schritte, "
-                            f"aber non_pred_feat hat nur {non_pred_feat.size(1)}.")
+            raise ValueError(
+                f"Nicht genug Wetterdaten! Prediction braucht {prediction_count} Schritte, "
+                f"aber non_pred_feat hat nur {non_pred_feat.size(1)}."
+            )
 
         # 1.  Extract dimensions
         # b: Batch, t_ctx: number of timesteps, c: number of input vars, height/width: patch size (256 or 128)
@@ -182,7 +199,7 @@ class ConvLSTM(nn.Module):
             # Input Shape: (B, T_ctx, C, H, W) -> Output Shape: (B, 1 (kNDVI), H, W)
             baseline = baseline_sample
         elif self.baseline == "mean_cube":
-            # Mean kNDVI over all T_ctx past timesteps
+            # Mean kNDVI over all T_ctx context timesteps
             # Input Shape: (B, T_ctx, C, H, W) -> Output Shape: (B, 1 (kNDVI), H, W)
             baseline = torch.mean(input_tensor[:, :, 0:1, :, :], dim=1)
         else:
@@ -191,11 +208,15 @@ class ConvLSTM(nn.Module):
             baseline = torch.zeros((b, 1, height, width), device=input_tensor.device)
 
         if baseline.size(-1) != width or baseline.size(1) != 1:
-            raise ValueError("Baseline Shape Mismatch! Check Channels and Spatial Dim.")
+            raise ValueError(
+                "Baseline Shape Mismatch! Check Channels and Spatial Dimensions."
+            )
 
         # -- 3. INITIALIZE STATES--
         # For each layer we need a Hidden State (h) and Cell State (c)
-        hs = []  # List of tensors: [(B, 64, H, W), (B, 64, H, W), ...]  # 64 = hidden_dim
+        hs = (
+            []
+        )  # List of tensors: [(B, 64, H, W), (B, 64, H, W), ...]  # 64 = hidden_dim
         cs = []  # List of tensors: [(B, 64, H, W), (B, 64, H, W), ...]
         for i in range(self.num_layers):
             hx, cx = self.encoder_cells[i].init_hidden(b, height, width)
@@ -215,7 +236,10 @@ class ConvLSTM(nn.Module):
                 hs[i], cs[i] = self.encoder_cells[i](input_t, (hs[i], cs[i]))
 
                 # Result of layer i becomes input for layer i+1
-                input_t = hs[i]
+                if i < self.num_layers - 1:
+                    input_t = self.dropout_layers[i](hs[i])
+                else:
+                    input_t = hs[i]
 
         # --- Prepare decoder ---
         # Create storage for results
@@ -236,22 +260,33 @@ class ConvLSTM(nn.Module):
             if t == 0:
                 # Am ersten Tag nehmen wir die Baseline + das Wetter von heute (t=0)
                 # Wir müssen sicherstellen, dass baseline und non_pred_feat zusammenpassen
-                guided_input = torch.cat([baseline, non_pred_feat[:, 0, :, :, :]], dim=1)
+                guided_input = torch.cat(
+                    [baseline, non_pred_feat[:, 0, :, :, :]], dim=1
+                )
                 curr_baseline = baseline
             else:
                 # In future timesteps we use prediction of day before as baseline + new weather
-                guided_input = torch.cat([preds[:, t - 1, :, :, :], non_pred_feat[:, t, :, :, :]], dim=1)
+                guided_input = torch.cat(
+                    [preds[:, t - 1, :, :, :], non_pred_feat[:, t, :, :, :]], dim=1
+                )
                 curr_baseline = preds[:, t - 1, :, :, :]
+                # ### HERE MAYBE:
+                # curr_baseline = baseline
 
             # --- SAFTEY CHECK ---
             if guided_input.size(1) != self.decoder_input_dim:
-                raise ValueError(f"Guided Input Channel Mismatch at timestep {t}! Expected {self.decoder_input_dim}, got {guided_input.size(1)}")
-            
+                raise ValueError(
+                    f"Guided Input Channel Mismatch at timestep {t}! Expected {self.decoder_input_dim}, got {guided_input.size(1)}"
+                )
+
             # Run through decoder layers
             input_t = guided_input
             for i in range(self.num_layers):
                 hs[i], cs[i] = self.decoder_cells[i](input_t, (hs[i], cs[i]))
-                input_t = hs[i]
+                if i < self.num_layers - 1:
+                    input_t = self.dropout_layers[i](hs[i])
+                else:
+                    input_t = hs[i]
 
             # Calculate delta and add to baseline to get final prediction
             delta = self.predict_layer(hs[-1])  # Get delta prediction from last layer
@@ -260,51 +295,121 @@ class ConvLSTM(nn.Module):
             preds[:, t, :, :, :] = curr_baseline + delta  # Final prediction
 
         return preds, pred_deltas, baselines
-    
-        # # --- 4. FIRST PREDICTION (day 1 in the future) ---
-        # baselines[:, 0, :, :, :] = baseline
-        # # Das oberste h (letzter Layer) nach dem Encoder-Durchlauf ist unser Delta
-        # # delta Shape: (B, 1 (kNDVI), H, W)
-        # delta = self.predict_layer(hs[-1])
-        # pred_deltas[:, 0, :, :, :] = delta  #  erste vorhersage nutzt keine future features
 
-        # # Final Prediction = Baseline + Delta
-        # # Shape: (B, 1 (kNDVI), H, W)
-        # preds[:, 0, :, :, :] = (
-        #     pred_deltas[:, 0, :, :, :] + baselines[:, 0, :, :, :]
-        # )  # set kNDVI value (delta + baseline) for timestep 0 in preds
 
-        # # -- 6. DECODER PHASE (Guided Future Prediction) --
-        # if prediction_count > 1:
+class SGConvLSTM(nn.Module):
+    def __init__(
+        self,
+        input_dim,  # Context-Channels (34)
+        output_dim,  # 1 (kNDVI)
+        hidden_dims,  # Liste der hidden dims pro Layer
+        kernel_size,
+        dilation,
+        num_layers,
+        baseline="last_frame",
+        dropout_prob=0.0,
+    ):
+        super(SGConvLSTM, self).__init__()
 
-        #     for t in range(
-        #         1, prediction_count
-        #     ):  # first prediction is already done see above
-        #         # GUIDING: Combine last prediction with new climate vars
-        #         # preds[:, t-1, :, :, :]: (B, 1 (kNDVI), H, W)
-        #         # non_pred_feat[:, t, :, :, :]]: (B, C_npf, H, W)
-        #         # combined_input: (B, C_npf + 1, H, W)
-        #         guided_input = torch.cat(
-        #             [preds[:, t - 1, :, :, :], non_pred_feat[:, t, :, :, :]], dim=1
-        #         )
+        self._check_kernel_size_consistency(kernel_size)
 
-        #         # Put through all layers
-        #         input_t = guided_input
-        #         for i in range(self.num_layers):
-        #             hs[i], cs[i] = self.decoder_cells[i](input_t, (hs[i], cs[i]))
-        #             input_t = hs[i]
+        self.input_dim = input_dim
+        self.hidden_dims = self._extend_for_multilayer(
+            hidden_dims, num_layers - 1
+        )  # if num_layer=3 and hidden_dims=64 -> [64, 64]
+        self.hidden_dims.append(
+            output_dim
+        )  # last layer is final convolution/prediction: -> [64, 64, 1]
+        self.num_layers = num_layers
+        self.baseline = baseline
+        self.dropout_prob = dropout_prob
 
-        #         # Update Baseline (Use last prediction as new baseline)
-        #         baselines[:, t, :, :, :] = preds[:, t - 1, :, :, :]
-        #         current_delta = self.predict_layer(hs[-1])
-        #         pred_deltas[:, t] = current_delta
-        #         preds[:, t, :, :, :] = (
-        #             baselines[:, t, :, :, :] + pred_deltas[:, t, :, :, :]
-        #         )
+        assert len(self.hidden_dims) == self.num_layers, (
+            f"Mismatch: hidden_dims has {len(self.hidden_dims)} entries, "
+            f"but num_layers is set to {self.num_layers}."
+        )
 
-        # # Return complete tensor with predictions for the timesteps
-        # # Shape: (Batch, prediction_count, 1 (kNDVI), 256, 256)
-        # return preds, pred_deltas, baselines
+        self.cell_list = nn.ModuleList()
+        for i in range(self.num_layers):
+            cur_in = self.input_dim if i == 0 else self.hidden_dims[i - 1]
+            self.cell_list.append(
+                ConvLSTMCell(cur_in, self.hidden_dims[i], kernel_size, dilation)
+            )
+
+        self.dropout_layers = nn.ModuleList(
+            [nn.Dropout2d(p=self.dropout_prob) for _ in range(self.num_layers - 1)]
+        )
+
+    def forward(self, input_tensor, prediction_count, non_pred_feat, baseline_sample):
+        b, t_ctx, _, height, width = input_tensor.size()
+
+        # 1. Initialize Baseline & State
+        baseline = baseline_sample.to(input_tensor.device)
+
+        if self.baseline == "last_frame":
+            baseline = baseline_sample
+        elif self.baseline == "mean_cube":
+            baseline = torch.mean(input_tensor[:, :, 0:1, :, :], dim=1)
+        else:
+            baseline = torch.zeros((b, 1, height, width), device=input_tensor.device)
+
+        hs, cs = [], []
+        for i in range(self.num_layers):
+            hx, cx = self.cell_list[i].init_hidden(b, height, width)
+            hs.append(hx)
+            cs.append(cx)
+
+        # 2. Iterate over the past
+        for t in range(t_ctx):
+            input_t = input_tensor[:, t]
+            for i in range(self.num_layers):
+                hs[i], cs[i] = self.cell_list[i](input_t, (hs[i], cs[i]))
+                input_t = (
+                    self.dropout_layers[i](hs[i]) if i < self.num_layers - 1 else hs[i]
+                )
+
+        # 3. Prepare prediction storage
+        preds = torch.zeros(
+            (b, prediction_count, 1, height, width), device=input_tensor.device
+        )
+        pred_deltas = torch.zeros_like(preds)
+        baselines = torch.zeros_like(preds)
+
+        # 4. Iterate over future (Guided prediction)
+        for t in range(prediction_count):
+            # Create precidtion input (baseline/prediction (of t-1) + weather)
+            curr_ref = baseline if t == 0 else preds[:, t - 1]
+            guided_input = torch.cat([curr_ref, non_pred_feat[:, t]], dim=1)
+
+            # As number of channels in the guided prediction differ from the input channels. Guided input (only weather + static + kNDVI predition) vs input (weather +  static + kNDVI + other S1 and S2 vars)
+            padding_size = self.input_dim - guided_input.size(1)
+            if padding_size > 0:
+                zeros_padding = torch.zeros(
+                    (b, padding_size, height, width), device=input_tensor.device
+                )
+                input_t = torch.cat([guided_input, zeros_padding], dim=1)
+                assert (
+                    input_t.size(1) == self.input_dim
+                ), f"Padding failed! Expected {self.input_dim}, got {input_t.size(1)}"
+            else:
+                input_t = guided_input
+
+            # Pass through layers
+            for i in range(self.num_layers):
+                hs[i], cs[i] = self.cell_list[i](input_t, (hs[i], cs[i]))
+                input_t = (
+                    self.dropout_layers[i](hs[i]) if i < self.num_layers - 1 else hs[i]
+                )
+
+            # Delta Vorhersage
+            delta = hs[-1]
+            curr_baseline = baseline if t == 0 else preds[:, t - 1]
+
+            pred_deltas[:, t] = delta
+            baselines[:, t] = curr_baseline
+            preds[:, t] = curr_baseline + delta
+
+        return preds, pred_deltas, baselines
 
     @staticmethod
     def _check_kernel_size_consistency(kernel_size):

@@ -25,7 +25,7 @@ class ARCEME_Dataset(Dataset):
         target_length,
         patch_size,
         train,
-        exclude_file=None,
+        exclude_file=None,  # usually is dealt with already during the split (kept here as safety net)
         s2_vars=None,
         s1_vars=None,
         era5_vars=None,
@@ -49,7 +49,9 @@ class ARCEME_Dataset(Dataset):
             fixed_tiles (list, optional): Spatial offsets for validation tiling.
             use_augmentation (bool): Whether to apply data augmentation.
         """
-        self.cube_paths = self._filter_cube_paths(cube_paths, exclude_file)
+        self.cube_paths = self._filter_cube_paths(
+            cube_paths, exclude_file
+        )  # filter bad cubes
         self.context_len = context_length
         self.target_len = target_length
         self.patch_size = patch_size
@@ -170,6 +172,7 @@ class ARCEME_Dataset(Dataset):
         # 1. Load excluded IDs from file or list
         if exclude_file is not None:
             if isinstance(exclude_file, str) and exclude_file.endswith(".csv"):
+                print(f"DEBUG: Received list with bad cubes at {exclude_file}")
                 df_ex = pd.read_csv(exclude_file)
                 if "cube_id" in df_ex.columns:
                     excluded_ids = set(
@@ -229,14 +232,14 @@ class ARCEME_Dataset(Dataset):
         try:
             ds = xr.open_zarr(path, consolidated=True)
         except Exception:
+            print(
+                f"WARNING: Failed to open {path} with consolidated=True. Retrying with consolidated=False."
+            )
             ds = xr.open_zarr(path, consolidated=False)
 
         # Get cube_id
         match = re.search(pattern, path)
-        if match:
-            cube_id = match.group(0)
-        else:
-            cube_id = "No_ID_Found"
+        cube_id = match.group(0) if match else "No_ID_Found"
 
         # Select spatial patch: (time, y, x)
         ds = ds.isel(
@@ -524,19 +527,13 @@ class ARCEME_Dataset(Dataset):
         # 10. AUGMENTATION (Training only)
         # ======================================================================
         if self.use_augmentation and self.train:
-            if torch.rand(1).item() > 0.5:  # Horizontal Flip
-                x_context = torch.flip(x_context, dims=[-1])
-                x_future_feat = torch.flip(x_future_feat, dims=[-1])
-                y_target = torch.flip(y_target, dims=[-1])
-                target_mask = torch.flip(target_mask, dims=[-1])
-                baseline_sample = torch.flip(baseline_sample, dims=[-1])
-
-            if torch.rand(1).item() > 0.5:  # Vertical Flip
-                x_context = torch.flip(x_context, dims=[-2])
-                x_future_feat = torch.flip(x_future_feat, dims=[-2])
-                y_target = torch.flip(y_target, dims=[-2])
-                target_mask = torch.flip(target_mask, dims=[-2])
-                baseline_sample = torch.flip(baseline_sample, dims=[-2])
+            k = torch.randint(0, 4, (1,)).item()
+            if k > 0:
+                x_context = torch.rot90(x_context, k, dims=[-2, -1])
+                x_future_feat = torch.rot90(x_future_feat, k, dims=[-2, -1])
+                y_target = torch.rot90(y_target, k, dims=[-2, -1])
+                target_mask = torch.rot90(target_mask, k, dims=[-2, -1])
+                baseline_sample = torch.rot90(baseline_sample, k, dims=[-2, -1])
 
         # NAN checks for critical tensors
         if torch.isnan(x_context).any():
@@ -555,7 +552,9 @@ class ARCEME_Dataset(Dataset):
 
 
 # --- Implementation of Leave-Time-and-Region-Out CV ---
-def get_llto_splits(root_dir, csv_path="train_test_split.csv", k=3, show=False):
+def get_llto_splits(
+    root_dir, csv_path="train_test_split.csv", k=3, show=False, exclude_file=None
+):
     """
     Implements k-fold Leave-Location-and-Time-Out (LLTO) splitting according to
     https://doi.org/10.1016/j.envsoft.2017.12.001.
@@ -586,6 +585,22 @@ def get_llto_splits(root_dir, csv_path="train_test_split.csv", k=3, show=False):
     initial_count = len(df)
     df = df.dropna(subset=["full_path"])
     print(f"Matched {len(df)}/{initial_count} cubes from CSV to disk.")
+
+    # --- Filter excluded cubes before splitting ---
+    if exclude_file is not None:
+        excluded_ids = []
+        if isinstance(exclude_file, str) and exclude_file.endswith(".csv"):
+            df_ex = pd.read_csv(exclude_file)
+            if "cube_id" in df_ex.columns:
+                excluded_ids = df_ex["cube_id"].astype(str).str.strip().tolist()
+        elif isinstance(exclude_file, list):
+            excluded_ids = [str(i).strip() for i in exclude_file]
+
+        before_count = len(df)
+        df = df[~df["DisNo."].isin(excluded_ids)]
+        print(
+            f"Filter (Pre-Split): {before_count} -> {len(df)} Cubes (Removed {before_count - len(df)} bad cubes)."
+        )
 
     # 3. Create the unique 'Location-Time' Group ID
     df["llto_group"] = (
@@ -640,6 +655,7 @@ def get_llto_splits_strict(
     min_val_ratio=0.15,
     show=False,
     save_path=None,
+    exclude_file=None,
 ):
     """
     Implements LLTO-CV ensuring a minimum validation size while reporting data usage.
@@ -653,7 +669,7 @@ def get_llto_splits_strict(
         k (int): Number of folds.
         min_val_ratio (float): Minimum percentage of total cubes for validation (e.g., 0.15).
         show (bool): If True, generates the strategy visualization plot.
-
+        exclude_file (str or list): Path to CSV file or list of excluded cube IDs.
     Returns:
         list: [(train_paths, val_paths), ...] for k folds.
     """
@@ -668,6 +684,20 @@ def get_llto_splits_strict(
     }
     df["full_path"] = df["DisNo."].map(processed_files)
     df = df.dropna(subset=["full_path"])
+
+    # --- Filter bad cubes before splitting ---
+    if exclude_file is not None:
+        excluded_ids = []
+        if isinstance(exclude_file, str) and exclude_file.endswith(".csv"):
+            df_ex = pd.read_csv(exclude_file)
+            if "cube_id" in df_ex.columns:
+                excluded_ids = df_ex["cube_id"].astype(str).str.strip().tolist()
+        elif isinstance(exclude_file, list):
+            excluded_ids = [str(i).strip() for i in exclude_file]
+
+        before_count = len(df)
+        df = df[~df["DisNo."].isin(excluded_ids)]
+        print(f"Filter (Pre-Split Strict): {before_count} -> {len(df)} Cubes.")
 
     total_cubes = len(df)
     min_val_cubes = int(total_cubes * min_val_ratio)

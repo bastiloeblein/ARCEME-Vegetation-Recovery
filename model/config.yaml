@@ -1,31 +1,79 @@
-experiment_name: "first_model"
+experiment_name: "first_SGConvLSTM"
 data:
+  quality_check:
+    # Context History
+    ctx_min_valid_ratio: 0.7    # At least X% of all pixels need to be valid
+    ctx_required_fraction: 0.6  # At least X% of timesteps in context have to be "usable"
+    ctx_min_valid_overall: 0.60  # A timestep is usable if it has more than X% valid pixels
+
+    # Target (Future)
+    tgt_min_valid_ratio: 0.2   # At least x% of valid pixels have to be valid
+    tgt_min_timesteps: 2       # At least X timesteps need to be usable
   patch_size: 256
   context_length: 20
   target_length: 5
   variables:
-    s2: ["kNDVI", "IRECI", "NDMI", "NIRv"] # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
-    s1: ["vv", "vh"]
-    era5: ["pei_360_mean"] # ["t2m_mean", "t2mmax_max", "t2mmin_min",  # Temperature
-    #"tp_dailymean_mean", "tp_dailymax_max",  "tp_rollingmax_max",   # Precipitation
-    #"pei_30_mean", "pei_90_mean"]                  # Drought index
-    static: [] #["COP_DEM", "is_veg"]                  # Static vars (ESA_LC not included because one hot encoding is done in dataloader)
+    s2:
+      - "kNDVI"
+      - "IRECI"
+      - "NDMI"
+      - "NIRv" # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
+    s1:
+      - "vv"
+      - "vh"
+    era5:
+      - "t2m_mean"
+      - "t2m_min"
+      - "t2m_max"
+      # - "t2mmax_max"
+      # - "t2mmin_min"
+      - "tp_dailymean_mean"
+      - "tp_dailymax_mean"
+      - "tp_rollingmax_mean"
+      - "pei_30_mean"
+      - "pei_90_mean"
+    static:
+      - "COP_DEM" # Static vars (ESA_LC not included because one hot encoding is done in dataloader)
+  data_loader:
+    num_workers: 4
 training:
-  start_learn_rate: 0.0003
-  optimizer: "adamW"
-  patience: 20
-  lr_factor: 0.1
-  lr_threshold: 0.0001
-  batch_size: 4
-  max_epochs: 100
+  optimizer:
+    name: "adamW"
+    start_learn_rate: 0.0001
+    warmup:
+      enabled: true
+      epochs: 5
+    lr_factor: 0.5
+    lr_threshold: 0.001
+    patience: 5
+  batch_size: 2
+  accumulate_grad_batches: 8
+  max_epochs: 200
   accelerator: "gpu"
   devices: 1
-  precision: "16-mixed"          # Nutzt Mixed Precision (spart VRAM auf der A6000)
-  use_augmentation: true
+  precision: "16-mixed"
+  use_augmentation: True
+  training_loss:
+    loss_function: "l1"
+    alpha: 1  # 0.2
+    beta: 0  # 5
+  scaling_factor: 10.0
+  validation:
+    selection_metric: "nnse"
+    monitor:
+      split: "val"
+      metric: "gm_nnse"
+    monitor_mode: "max"  # "max" for nnse, "min" for loss
+    min_pixel_threshold: 100000 #  Minimum pixel threshold, so a cube is consider for validation metric calculation
 model:
-  output_channels: 1      # Wir wollen nur kNDVI vorhersagen
-  hidden_channels: [64, 64, 64] # Drei Layer mit je 64 Filtern
+  model_type: "SGConvLSTM"
+  output_channels: 1      # We want to predict 1 channel (kNDVI)
+  hidden_channels:       # if SGEDConvLSTM number of layers and len(hidden_dims) must match - if SGConvLSTM len(hidden_dims) must be: n_layers -1 (the final layer is added within the model (convolution to 1)
+      - 128
+      - 64
+      #- 1
   n_layers: 3
   kernel: 5
   dilation_rate: 1
-  baseline: "last_frame"  # Optionen: "last_frame", "mean_cube", "zeros"
+  baseline: "last_frame"  # Options: "last_frame", "mean_cube", "zeros"
+  dropout_prob: 0.3       # dropout to avoid overfitting
