@@ -144,9 +144,24 @@ class ConvLSTM_Model(pl.LightningModule):
         # Combined loss weighted by alpha and beta
         combined_loss = self.alpha * train_loss + self.beta * train_delta_loss
 
-        self.log("train_loss", train_loss, prog_bar=True, on_epoch=True, batch_size=bs)
-        self.log("train_delta_loss", train_delta_loss, on_epoch=True, batch_size=bs)
-        self.log("combined_loss", combined_loss, on_epoch=True, batch_size=bs)
+        self.log(
+            "train_loss",
+            train_loss,
+            prog_bar=True,
+            on_epoch=True,
+            batch_size=bs,
+            sync_dist=True,
+        )
+        self.log(
+            "train_delta_loss",
+            train_delta_loss,
+            on_epoch=True,
+            batch_size=bs,
+            sync_dist=True,
+        )
+        self.log(
+            "combined_loss", combined_loss, on_epoch=True, batch_size=bs, sync_dist=True
+        )
 
         return combined_loss
 
@@ -161,6 +176,13 @@ class ConvLSTM_Model(pl.LightningModule):
         y_pred, y_delta_pred, baselines = self(
             x_ctx, y_true.size(1), x_fut, baseline_sample
         )
+
+        ### --- PERSISTENCE BASELINE METRICS ---
+        persistence_pred = baselines.expand_as(y_true)
+        diff_base = torch.abs(persistence_pred - y_true) * mask
+        abs_err_base = diff_base.view(bs, -1).sum(dim=1).detach()
+        sq_err_base = (diff_base**2).view(bs, -1).sum(dim=1).detach()
+        y_pred_base_sum = (persistence_pred * mask).view(bs, -1).sum(dim=1).detach()
 
         # Basic metric collection (ignoring masked pixels)
         diff = torch.abs(y_pred - y_true) * mask
@@ -190,13 +212,26 @@ class ConvLSTM_Model(pl.LightningModule):
                         "y_true_sum": y_true_sum[i],
                         "pixels": valid_pixels[i],
                         "y_true_raw": y_true[i][mask[i].bool()].detach().cpu(),
+                        # Baseline stats (NEW)
+                        "abs_err_base": abs_err_base[i],
+                        "sq_err_base": sq_err_base[i],
+                        "y_pred_base_sum": y_pred_base_sum[i],
                     }
                 )
 
-        ###### Kann raus#########################
-        if batch_idx == 2:
-            self.example_val_batch = batch
-        #########################################
+        # Save patches for visualization of predictions over the epochs
+        if not hasattr(self, "fixed_val_batches"):
+            self.fixed_val_batches = []
+        if len(self.fixed_val_batches) < 3 and batch_idx in [0, 2, 4]:
+            safe_batch = [
+                x_ctx.detach().cpu().clone(),
+                x_fut.detach().cpu().clone(),
+                y_true.detach().cpu().clone(),
+                mask.detach().cpu().clone(),
+                meta,  # No detach needed for dicts!
+                baseline_sample.detach().cpu().clone(),
+            ]
+            self.fixed_val_batches.append(safe_batch)
 
     def on_validation_epoch_end(self):
         """
@@ -215,85 +250,89 @@ class ConvLSTM_Model(pl.LightningModule):
                 cubes[cid] = {
                     "abs_err": 0,
                     "sq_err": 0,
+                    "abs_err_base": 0,
+                    "sq_err_base": 0,
+                    "y_pred_base_sum": 0,
                     "pixels": 0,
                     "y_pred_sum": 0,
                     "y_true_sum": 0,
                     "y_true_list": [],
                 }
-
-            cubes[cid]["abs_err"] += out["abs_err"]
-            cubes[cid]["sq_err"] += out["sq_err"]
-            cubes[cid]["pixels"] += out["pixels"]
-            cubes[cid]["y_pred_sum"] += out["y_pred_sum"]
-            cubes[cid]["y_true_sum"] += out["y_true_sum"]
+            for key in [
+                "abs_err",
+                "sq_err",
+                "y_pred_sum",
+                "abs_err_base",
+                "sq_err_base",
+                "y_pred_base_sum",
+                "pixels",
+                "y_true_sum",
+            ]:
+                cubes[cid][key] += out[key]
             cubes[cid]["y_true_list"].append(out["y_true_raw"])
 
         # 2. Calculate metrics per cube
         # Using lists to store grand mean components
-        cube_metrics = {"l1": [], "mse": [], "nnse": [], "r2": [], "bias": []}
+        gm_metrics = {
+            k: []
+            for k in [
+                "l1",
+                "mse",
+                "bias",
+                "r2",
+                "nnse",
+                "l1_base",
+                "mse_base",
+                "bias_base",
+                "r2_base",
+                "nnse_base",
+            ]
+        }
 
         # Define minimum pixel threshold to ensure statistical significance per cube
         min_pixel_threshold = self.cfg["training"]["validation"].get(
             "min_pixel_threshold", 10000
-        )  # TODO: This should be handled in data loader!!
+        )  # TODO: This should be handled before.
 
+        eps = 1e-8
         for cid, data in cubes.items():
             # Skip cubes with insufficient valid data to avoid noisy outliers
             if data["pixels"] < min_pixel_threshold:
                 continue
 
-            # A) Basic Pixel-Weighted Metrics
-            l1_cube = data["abs_err"] / data["pixels"]
-            mse_cube = data["sq_err"] / data["pixels"]
-
-            # B) Mean Bias Error (MBE)
-            # Positive = Overestimation, Negative = Underestimation
-            bias_cube = (data["y_pred_sum"] - data["y_true_sum"]) / data["pixels"]
-
-            # C) Variance for R2 & NNSE
-            # Concatenate all true values for this cube to calculate variance
+            # Concatenate all pixels of the cube for variance
             y_all = torch.cat(data["y_true_list"])
+            variance = torch.var(y_all) + eps
 
-            # Ensure there are enough data points for variance calculation
-            if y_all.numel() > 1:
-                variance = torch.var(y_all)
-            else:
-                variance = torch.tensor(0.0)
+            # --- MODEL METRICS ---
+            mse_m = data["sq_err"] / data["pixels"]
+            r2_m = 1 - (mse_m / variance)
+            gm_metrics["l1"].append(data["abs_err"] / data["pixels"])
+            gm_metrics["mse"].append(mse_m)
+            gm_metrics["bias"].append(
+                (data["y_pred_sum"] - data["y_true_sum"]) / data["pixels"]
+            )
+            gm_metrics["r2"].append(r2_m)
+            gm_metrics["nnse"].append(1 / (2 - r2_m))
 
-            # D) R2 Score & Normalized Nash-Sutcliffe Efficiency (NNSE)
-            # Add a small epsilon to prevent division by zero if variance is zero
-            # R2 = 1 - (MSE / Variance)
-            eps = 1e-8
-            r2_cube = 1 - (mse_cube / (variance + eps))
+            # --- BASELINE METRICS (NEW) ---
+            mse_b = data["sq_err_base"] / data["pixels"]
+            r2_b = 1 - (mse_b / variance)
+            gm_metrics["l1_base"].append(data["abs_err_base"] / data["pixels"])
+            gm_metrics["mse_base"].append(mse_b)
+            gm_metrics["bias_base"].append(
+                (data["y_pred_base_sum"] - data["y_true_sum"]) / data["pixels"]
+            )
+            gm_metrics["r2_base"].append(r2_b)
+            gm_metrics["nnse_base"].append(1 / (2 - r2_b))
 
-            # NNSE n (s. Pellicer-Valero)
-            nnse_cube = 1 / (2 - r2_cube)
+        # Log Grand Means
+        for k, values in gm_metrics.items():
+            if values:
+                metric_name = f"val_gm_{k}"
+                self.log(metric_name, torch.stack(values).mean(), sync_dist=True)
 
-            # Now put all individual cube metrics in dict
-            cube_metrics["l1"].append(l1_cube)
-            cube_metrics["mse"].append(mse_cube)
-            cube_metrics["bias"].append(bias_cube)
-            cube_metrics["r2"].append(r2_cube)
-            cube_metrics["nnse"].append(nnse_cube)
-
-        # 3. Grand Mean Calculation (Averaging across cubes)
-        # Each cube carries the same weight in the final score
-        if len(cube_metrics["l1"]) > 0:
-            # Convert lists to tensors for averaging
-            gm_l1 = torch.stack(cube_metrics["l1"]).mean()
-            gm_mse = torch.stack(cube_metrics["mse"]).mean()
-            gm_bias = torch.stack(cube_metrics["bias"]).mean()
-            gm_r2 = torch.stack(cube_metrics["r2"]).mean()
-            gm_nnse = torch.stack(cube_metrics["nnse"]).mean()
-
-            # 4. Final Logging to Progress Bar and Logger
-            self.log("val_gm_loss", gm_l1, prog_bar=True, sync_dist=True)
-            self.log("val_gm_mse", gm_mse, sync_dist=True)
-            self.log("val_gm_bias", gm_bias, sync_dist=True)
-            self.log("val_gm_r2", gm_r2, sync_dist=True)
-            self.log("val_gm_nnse", gm_nnse, prog_bar=True, sync_dist=True)
-
-        # 5. Log current learning rate from optimizer
+        # Log current learning rate from optimizer
         opt = self.optimizers()
         current_lr = opt.param_groups[0]["lr"]
         self.log("learning_rate", current_lr, prog_bar=True, on_epoch=True)
@@ -301,49 +340,55 @@ class ConvLSTM_Model(pl.LightningModule):
         ## kann auch raus nur für test
         # --- Visualizations ---
         # Log visual samples every X epochs
-        log_every_n_epochs = 5
-        if self.current_epoch % log_every_n_epochs == 0 and hasattr(
-            self, "example_val_batch"
+        log_interval = 5
+        if self.current_epoch % log_interval == 0 and hasattr(
+            self, "fixed_val_batches"
         ):
-            self.visualize_and_log_hidden(self.example_val_batch)
 
-            x_ctx, x_fut, y_true, mask, meta, baseline_sample = self.example_val_batch
-            y_pred, y_delta_pred, baselines = self(
-                x_ctx, y_true.size(1), x_fut, baseline_sample
-            )
+            for i, val_batch in enumerate(self.fixed_val_batches):
 
-            # Plot deltas
-            fig_deltas = plot_prediction_deltas(
-                y_true,
-                y_pred,
-                y_delta_pred,
-                baselines,
-                mask,
-                0,
-                self.current_epoch,
-                save_path="plots",
-            )
-            if isinstance(self.logger, WandbLogger):
-                self.logger.experiment.log(
-                    {
-                        "Visuals/Deltas": fig_deltas,
-                        "epoch": self.current_epoch,
-                        "global_step": self.global_step,
-                    }
+                batch_cuda = []
+                for t in val_batch:
+                    if torch.is_tensor(t):
+                        batch_cuda.append(t.to(self.device))
+                    else:
+                        batch_cuda.append(t)
+
+                x_ctx, x_fut, y_true, mask, meta, baseline_sample = batch_cuda
+
+                self.visualize_and_log_hidden(batch_cuda)
+
+                with torch.no_grad():
+                    y_pred, y_delta_pred, baselines = self(
+                        x_ctx, y_true.size(1), x_fut, baseline_sample
+                    )
+
+                fig = plot_prediction_deltas(
+                    y_true,
+                    y_pred,
+                    y_delta_pred,
+                    baselines,
+                    mask,
+                    batch_idx=i,
+                    epoch=self.current_epoch,
+                    save_path="plots",
                 )
-            else:
-                self.logger.experiment.add_figure(
-                    f"Visuals/Deltas_Epoch_{self.current_epoch}",
-                    fig_deltas,
-                    global_step=self.current_epoch,
-                )
-            plt.close(fig_deltas)
+
+                if isinstance(self.logger, WandbLogger):
+                    self.logger.experiment.log(
+                        {f"Fixed_Samples/Patch_{i}": fig, "epoch": self.current_epoch}
+                    )
+                else:
+                    self.logger.experiment.add_figure(
+                        f"Visuals/Deltas_Epoch_{self.current_epoch}",
+                        fig,
+                        global_step=self.current_epoch,
+                    )
+
+                plt.close(fig)
 
         # --- Memory Cleanup ---
-        # Clear the list to free memory for the next validation epoch
         self.validation_step_outputs.clear()
-        if hasattr(self, "example_val_batch"):
-            del self.example_val_batch
 
     def configure_optimizers(self):
         """
@@ -473,19 +518,17 @@ class ConvLSTM_Model(pl.LightningModule):
         # Deine Funktion von oben aufrufen
         fig = self.visualize_hidden_states(x_ctx, x_fut, baseline_sample)
 
-        fold_idx = getattr(self, "fold_idx", 0)
-
         if isinstance(self.logger, WandbLogger):
             self.logger.experiment.log(
                 {
-                    f"Debug/Hidden_States_Fold_{fold_idx}": fig,
+                    "Debug/Hidden_States": fig,
                     "epoch": self.current_epoch,
                     "global_step": self.global_step,
                 }
             )
         else:
             self.logger.experiment.add_figure(
-                f"Debug/Hidden_States_Fold_{fold_idx}_{self.current_epoch}",
+                f"Debug/Hidden_States_Epoch_{self.current_epoch}",
                 fig,
                 global_step=self.current_epoch,
             )

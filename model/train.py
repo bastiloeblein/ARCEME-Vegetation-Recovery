@@ -4,6 +4,7 @@ import os
 import random
 import json
 import sys
+import wandb
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -13,6 +14,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers import WandbLogger
 from my_utils.check_cubes import update_exclusion_list
+import multiprocessing as mp
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -297,6 +299,7 @@ def main():
         del train_ds, val_ds
         del train_loader, val_loader
         torch.cuda.empty_cache()
+        wandb.finish()
 
     # --- Final Summary ---
     if cfg["training"]["validation"]["monitor_mode"] == "min":
@@ -318,8 +321,6 @@ def main():
 
 
 if __name__ == "__main__":
-    import multiprocessing as mp
-
     mp.set_start_method("spawn", force=True)
 
     main()
