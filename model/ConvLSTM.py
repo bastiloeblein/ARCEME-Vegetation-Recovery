@@ -2,9 +2,27 @@ import torch
 import torch.nn as nn
 
 
+def _check_kernel_size_consistency(kernel_size):
+    if not (
+        isinstance(kernel_size, tuple)
+        or isinstance(kernel_size, int)
+        or (
+            isinstance(kernel_size, list)
+            and all([isinstance(elem, tuple) for elem in kernel_size])
+        )
+    ):
+        raise ValueError("`kernel_size` must be tuple or list of tuples")
+
+
+def _extend_for_multilayer(param, num_layers):
+    if not isinstance(param, list):
+        param = [param] * num_layers
+    return param
+
+
 class ConvLSTMCell(nn.Module):
 
-    def __init__(self, input_dim, hidden_dim, kernel_size, dilation):
+    def __init__(self, input_dim, hidden_dim, kernel_size, dilation, layer_norm_flag):
         """
         input_dim: Anzahl der Kanäle, die reinkommen (deine 34).
         hidden_dim: Wie groß das Gedächtnis pro Pixel sein soll (z.B. 64).
@@ -20,9 +38,10 @@ class ConvLSTMCell(nn.Module):
         self.hidden_dim = hidden_dim
         self.kernel_size = kernel_size
         self.dilation = dilation
+        self.layer_norm_flag = layer_norm_flag
 
-        self.hidden_h_param = nn.Parameter(torch.zeros(1, hidden_dim, 1, 1))
-        self.hidden_c_param = nn.Parameter(torch.zeros(1, hidden_dim, 1, 1))
+        # self.hidden_h_param = nn.Parameter(torch.zeros(1, hidden_dim, 1, 1))
+        # self.hidden_c_param = nn.Parameter(torch.zeros(1, hidden_dim, 1, 1))
 
         self.conv = nn.Conv2d(
             in_channels=self.input_dim
@@ -36,7 +55,12 @@ class ConvLSTMCell(nn.Module):
             bias=True,  # Adds learnable bias to the output
         )
 
-        self._init_weights()
+        if self.layer_norm_flag:
+            self.layer_norm = nn.InstanceNorm2d(
+                self.input_dim + self.hidden_dim, affine=True
+            )
+
+        # self._init_weights()
 
     def forward(self, input_tensor, cur_state):
         """
@@ -54,6 +78,9 @@ class ConvLSTMCell(nn.Module):
         combined = torch.cat(
             [input_tensor, h_cur], dim=1
         )  # Glue the input_dims (34 channels) with the 64 channels (hidden_dims) from  the previous memory -> 98 channels
+
+        if self.layer_norm_flag:
+            combined = self.layer_norm(combined)
 
         # Convolution
         combined_conv = self.conv(
@@ -99,11 +126,21 @@ class ConvLSTMCell(nn.Module):
                 1.0
             )  # set bias of forget gate to 1.0 -> at beginning model keeps information
 
+    # def init_hidden(self, batch_size, height, width):
+
+    #     h_start = self.hidden_h_param.expand(batch_size, -1, height, width)
+    #     c_start = self.hidden_c_param.expand(batch_size, -1, height, width)
+
+    #     return h_start, c_start
+
     def init_hidden(self, batch_size, height, width):
-
-        h_start = self.hidden_h_param.expand(batch_size, -1, height, width)
-        c_start = self.hidden_c_param.expand(batch_size, -1, height, width)
-
+        # Erzeuge neutrale Nullen direkt auf dem richtigen Device
+        h_start = torch.zeros(
+            batch_size, self.hidden_dim, height, width, device=self.conv.weight.device
+        )
+        c_start = torch.zeros(
+            batch_size, self.hidden_dim, height, width, device=self.conv.weight.device
+        )
         return h_start, c_start
 
 
@@ -119,6 +156,7 @@ class SGEDConvLSTM(nn.Module):
         num_layers,
         baseline="last_frame",
         dropout_prob=0.0,
+        layer_norm_flag=False,
     ):
         """
         input_dim: Channels in context tensor (z.B. 34)
@@ -132,13 +170,20 @@ class SGEDConvLSTM(nn.Module):
                 f"hidden_dims muss eine Liste der Länge num_layers ({num_layers}) sein."
             )
 
-        self._check_kernel_size_consistency(kernel_size)
+        # self._check_kernel_size_consistency(kernel_size)
+        _check_kernel_size_consistency(kernel_size)
         self.input_dim = input_dim
         self.decoder_input_dim = decoder_input_dim
         self.hidden_dims = hidden_dims  # Expects a list - 1 for each layer
         self.kernel_size = kernel_size
+        self.dilation = dilation
         self.num_layers = num_layers
         self.baseline = baseline
+        self.layer_norm_flag = layer_norm_flag
+
+        # self.batch_norms = nn.ModuleList([
+        #     nn.BatchNorm2d(hidden_dims[i]) for i in range(self.num_layers)
+        # ])
 
         self.dropout_prob = dropout_prob
 
@@ -152,7 +197,13 @@ class SGEDConvLSTM(nn.Module):
         for i in range(self.num_layers):
             cur_in = self.input_dim if i == 0 else self.hidden_dims[i - 1]
             self.encoder_cells.append(
-                ConvLSTMCell(cur_in, self.hidden_dims[i], kernel_size, dilation)
+                ConvLSTMCell(
+                    cur_in,
+                    self.hidden_dims[i],
+                    self.kernel_size,
+                    self.dilation,
+                    self.layer_norm_flag,
+                )
             )
 
         # DECODER LAYERS (für die Zukunft - angepasste Eingangsgröße!)
@@ -160,15 +211,25 @@ class SGEDConvLSTM(nn.Module):
         for i in range(self.num_layers):
             cur_in = self.decoder_input_dim if i == 0 else self.hidden_dims[i - 1]
             self.decoder_cells.append(
-                ConvLSTMCell(cur_in, self.hidden_dims[i], kernel_size, dilation)
+                ConvLSTMCell(
+                    cur_in,
+                    self.hidden_dims[i],
+                    self.kernel_size,
+                    self.dilation,
+                    self.layer_norm_flag,
+                )
             )
 
         # Verwandelt abstrakte "Gedächtnis" (zb. 64 Kanäle in hidden state) in tatsächlichen kNDVI (1 Kanal) um
         self.predict_layer = nn.Conv2d(
-            in_channels=hidden_dims[-1],  # Die channels from previous hidden state
+            in_channels=self.hidden_dims[-1],  # Die channels from previous hidden state
             out_channels=output_dim,  # 1 channel for kNDVI
             kernel_size=1,
         )
+
+        # Maybe delete
+        nn.init.constant_(self.predict_layer.weight, 0.0)
+        nn.init.constant_(self.predict_layer.bias, 0.0)
 
     def forward(self, input_tensor, prediction_count, non_pred_feat, baseline_sample):
         """
@@ -235,11 +296,15 @@ class SGEDConvLSTM(nn.Module):
                 # hs[i] Shape: (B, 64, H, W)  64: hidden_dim
                 hs[i], cs[i] = self.encoder_cells[i](input_t, (hs[i], cs[i]))
 
+                # input_t = self.batch_norms[i](hs[i])
+
                 # Result of layer i becomes input for layer i+1
                 if i < self.num_layers - 1:
                     input_t = self.dropout_layers[i](hs[i])
+                    # input_t = self.dropout_layers[i](input_t) #  batch_norm
                 else:
                     input_t = hs[i]
+                    # input_t = self.batch_norms[i](hs[i]) # batch_norm
 
         # --- Prepare decoder ---
         # Create storage for results
@@ -266,10 +331,20 @@ class SGEDConvLSTM(nn.Module):
                 curr_baseline = baseline
             else:
                 # In future timesteps we use prediction of day before as baseline + new weather
+                ## DAS IST EIN TEST: (probiere mal aus!!)
+                prev_pred = preds[:, t - 1, :, :, :].detach()
+
                 guided_input = torch.cat(
-                    [preds[:, t - 1, :, :, :], non_pred_feat[:, t, :, :, :]], dim=1
+                    [prev_pred, non_pred_feat[:, t, :, :, :]], dim=1
                 )
-                curr_baseline = preds[:, t - 1, :, :, :]
+                curr_baseline = prev_pred
+
+                # Vorher: Ohne detach
+                # guided_input = torch.cat(
+                #     [preds[:, t - 1, :, :, :] , non_pred_feat[:, t, :, :, :]], dim=1
+                # )
+                # curr_baseline = preds[:, t - 1, :, :, :]
+
                 # ### HERE MAYBE:
                 # curr_baseline = baseline
 
@@ -283,13 +358,23 @@ class SGEDConvLSTM(nn.Module):
             input_t = guided_input
             for i in range(self.num_layers):
                 hs[i], cs[i] = self.decoder_cells[i](input_t, (hs[i], cs[i]))
+
+                # input_t = self.batch_norms[i](hs[i]) # batch_norm
+
                 if i < self.num_layers - 1:
+                    # input_t = self.dropout_layers[i](input_t)
                     input_t = self.dropout_layers[i](hs[i])
                 else:
                     input_t = hs[i]
+                    # input_t = self.batch_norms[i](hs[i]) # batch_norm
 
             # Calculate delta and add to baseline to get final prediction
             delta = self.predict_layer(hs[-1])  # Get delta prediction from last layer
+
+            #  USE TANH TO KEEP DELTA IN CHECK (BETWEEN -1 AND 1) -> HELPS WITH STABILITY
+            # MAYBE EVEN ADD: * 0.1 -> to really limit the step size of the predictions and make training more stable
+            delta = torch.tanh(delta) * 0.2
+
             pred_deltas[:, t, :, :, :] = delta  # Store delta prediction
             baselines[:, t, :, :, :] = curr_baseline  # Store baseline for this timestep
             preds[:, t, :, :, :] = curr_baseline + delta  # Final prediction
@@ -308,32 +393,47 @@ class SGConvLSTM(nn.Module):
         num_layers,
         baseline="last_frame",
         dropout_prob=0.0,
+        layer_norm_flag=False,
     ):
         super(SGConvLSTM, self).__init__()
 
-        self._check_kernel_size_consistency(kernel_size)
+        # self._check_kernel_size_consistency(kernel_size)
+        _check_kernel_size_consistency(kernel_size)
 
         self.input_dim = input_dim
-        self.hidden_dims = self._extend_for_multilayer(
-            hidden_dims, num_layers - 1
-        )  # if num_layer=3 and hidden_dims=64 -> [64, 64]
+        self.hidden_dims = _extend_for_multilayer(hidden_dims, num_layers - 1)
         self.hidden_dims.append(
             output_dim
         )  # last layer is final convolution/prediction: -> [64, 64, 1]
+        self.kernel_size = kernel_size
+        self.dilation = dilation
         self.num_layers = num_layers
+        self.layer_norm_flag = layer_norm_flag
         self.baseline = baseline
         self.dropout_prob = dropout_prob
+
+        # self.batch_norms = nn.ModuleList([
+        #     nn.BatchNorm2d(hidden_dims[i]) for i in range(self.num_layers)
+        # ])
 
         assert len(self.hidden_dims) == self.num_layers, (
             f"Mismatch: hidden_dims has {len(self.hidden_dims)} entries, "
             f"but num_layers is set to {self.num_layers}."
         )
 
-        self.cell_list = nn.ModuleList()
-        for i in range(self.num_layers):
+        cell_list = nn.ModuleList()
+        for i in range(0, self.num_layers):
             cur_in = self.input_dim if i == 0 else self.hidden_dims[i - 1]
-            self.cell_list.append(
-                ConvLSTMCell(cur_in, self.hidden_dims[i], kernel_size, dilation)
+            cur_layer_norm_flag = self.layer_norm_flag if i != 0 else False
+
+            cell_list.append(
+                ConvLSTMCell(
+                    cur_in,
+                    self.hidden_dims[i],
+                    self.kernel_size,
+                    self.dilation,
+                    cur_layer_norm_flag,
+                )
             )
 
         self.dropout_layers = nn.ModuleList(
@@ -341,6 +441,23 @@ class SGConvLSTM(nn.Module):
         )
 
     def forward(self, input_tensor, prediction_count, non_pred_feat, baseline_sample):
+        # --- INPUT ASSERTS ---
+        assert (
+            input_tensor.dim() == 5
+        ), f"input_tensor must be 5D (B, T, C, H, W), got {input_tensor.dim()}D"
+        assert (
+            input_tensor.size(2) == self.input_dim
+        ), f"Input tensor channels must match input_dim ({self.input_dim})"
+        assert input_tensor.size(-1) == input_tensor.size(
+            -2
+        ), "Input tensor must have square spatial dimensions"
+        assert (
+            non_pred_feat.size(1) == prediction_count
+        ), "Future features must match prediction count"
+        assert (
+            baseline_sample.size(1) == 1
+        ), "Baseline must have exactly 1 channel (kNDVI)"
+
         b, t_ctx, _, height, width = input_tensor.size()
 
         # 1. Initialize Baseline & State
@@ -377,8 +494,14 @@ class SGConvLSTM(nn.Module):
 
         # 4. Iterate over future (Guided prediction)
         for t in range(prediction_count):
-            # Create precidtion input (baseline/prediction (of t-1) + weather)
-            curr_ref = baseline if t == 0 else preds[:, t - 1]
+
+            # Create prediction input (baseline/prediction (of t-1) + weather)
+            # curr_ref = baseline if t == 0 else preds[:, t - 1]
+            # DETACH to avoid gradient explosion
+            curr_ref = baseline if t == 0 else preds[:, t - 1].detach()
+
+            # BUILD GUIDED INPUT
+            # 1. Position kNDVI prediction (curr_ref) as first channel + non_pred_feat (weather + statics) after that  (as in the context input tensor)
             guided_input = torch.cat([curr_ref, non_pred_feat[:, t]], dim=1)
 
             # As number of channels in the guided prediction differ from the input channels. Guided input (only weather + static + kNDVI predition) vs input (weather +  static + kNDVI + other S1 and S2 vars)
@@ -387,12 +510,14 @@ class SGConvLSTM(nn.Module):
                 zeros_padding = torch.zeros(
                     (b, padding_size, height, width), device=input_tensor.device
                 )
+                # Add zeros at the end (so they match channel position of the original input tensor)
                 input_t = torch.cat([guided_input, zeros_padding], dim=1)
-                assert (
-                    input_t.size(1) == self.input_dim
-                ), f"Padding failed! Expected {self.input_dim}, got {input_t.size(1)}"
             else:
                 input_t = guided_input
+
+            assert (
+                input_t.size(1) == self.input_dim
+            ), f"Padding failed! Expected {self.input_dim}, got {input_t.size(1)}"
 
             # Pass through layers
             for i in range(self.num_layers):
@@ -403,28 +528,11 @@ class SGConvLSTM(nn.Module):
 
             # Delta Vorhersage
             delta = hs[-1]
-            curr_baseline = baseline if t == 0 else preds[:, t - 1]
+
+            delta = torch.tanh(delta) * 0.1
 
             pred_deltas[:, t] = delta
-            baselines[:, t] = curr_baseline
-            preds[:, t] = curr_baseline + delta
+            baselines[:, t] = curr_ref
+            preds[:, t] = curr_ref + delta
 
         return preds, pred_deltas, baselines
-
-    @staticmethod
-    def _check_kernel_size_consistency(kernel_size):
-        if not (
-            isinstance(kernel_size, tuple)
-            or isinstance(kernel_size, int)
-            or (
-                isinstance(kernel_size, list)
-                and all([isinstance(elem, tuple) for elem in kernel_size])
-            )
-        ):
-            raise ValueError("`kernel_size` must be tuple or list of tuples")
-
-    @staticmethod
-    def _extend_for_multilayer(param, num_layers):
-        if not isinstance(param, list):
-            param = [param] * num_layers
-        return param

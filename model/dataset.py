@@ -213,18 +213,26 @@ class ARCEME_Dataset(Dataset):
         # ======================================================================
         # 1. PATCHING STRATEGY
         # ======================================================================
-        if not self.train and self.fixed_tiles is not None:
-            # VALIDATION: Use the pre-calculated grid offsets for patching
-            tile_info = self.fixed_tiles[idx]
-            path = tile_info["path"]
-            top = tile_info["top"]
-            left = tile_info["left"]
+        if not self.train:
+            if self.fixed_tiles is not None:
+                tile_info = self.fixed_tiles[idx]
+                path = tile_info["path"]
+                top = tile_info["top"]
+                left = tile_info["left"]
+            else:
+                # FALLBACK: If no fixed_tiles defined always take the middle
+                real_idx = idx % len(self.cube_paths)
+                path = self.cube_paths[real_idx]
+                top = (h - self.patch_size) // 2
+                left = (w - self.patch_size) // 2
         else:
             # TRAINING: Random cropping from a randomly (through shuffling in the dataloader) selected cube
             real_idx = idx % len(self.cube_paths)
             path = self.cube_paths[real_idx]
-            top = np.random.randint(0, h - self.patch_size)
-            left = np.random.randint(0, w - self.patch_size)
+            # top = np.random.randint(0, h - self.patch_size)
+            # left = np.random.randint(0, w - self.patch_size)
+            top = torch.randint(0, h - self.patch_size, (1,)).item()
+            left = torch.randint(0, w - self.patch_size, (1,)).item()
 
         # ======================================================================
         # 2. DATA LOADING & SPATIAL SLICING
@@ -314,6 +322,8 @@ class ARCEME_Dataset(Dataset):
             x_era5_1d = torch.from_numpy(
                 ds_ctx[self.era5_vars].to_array().values
             ).float()
+
+            x_era5_1d = torch.clamp(x_era5_1d, min=-3.0, max=3.0) / 3.0
             x_era5 = broadcast_era5(x_era5_1d, self.patch_size, self.patch_size)
         else:
             # Erzeuge einen leeren Tensor mit 0 Kanälen, aber passenden anderen Dimensionen
@@ -358,10 +368,11 @@ class ARCEME_Dataset(Dataset):
         # ======================================================================
         # lc: (T_ctx, H, W) -> lc_onehot: (T_ctx, 12, H, W)
         lc = torch.from_numpy(ds_ctx["ESA_LC"].values).long()
-        lc_onehot = encode_landcover(lc)
+        lc_onehot = encode_landcover(lc)  # Shape: (T_ctx, 12, H, W)
+        lc_onehot = lc_onehot.permute(1, 0, 2, 3)  # NOW: (12, T_ctx, 256, 256)
         self._check_shape(
             lc_onehot,
-            (self.context_len, 12, self.patch_size, self.patch_size),
+            (12, self.context_len, self.patch_size, self.patch_size),
             "lc_onehot",
             path,
         )
@@ -385,12 +396,12 @@ class ARCEME_Dataset(Dataset):
         # Combine LC and Statics -> x_static: (C_lc+stat, T_ctx, H, W)
         # Note: Permute used to align channels for concatenation
         x_static = torch.cat(
-            [lc_onehot, x_stat_raw.permute(1, 0, 2, 3)], dim=1
-        ).permute(1, 0, 2, 3)
+            [lc_onehot, x_stat_raw], dim=0
+        )  # Shape x_static: (12 + len(static_vars), T_ctx, 256, 256)
         self._check_shape(
             x_static,
             (
-                len(self.static_vars) + lc_onehot.shape[1],
+                len(self.static_vars) + lc_onehot.shape[0],
                 self.context_len,
                 self.patch_size,
                 self.patch_size,
@@ -399,17 +410,42 @@ class ARCEME_Dataset(Dataset):
             path,
         )
 
-        # Final Context Stack -> x_context: (T_ctx, C_total, H, W)
-        x_context = torch.cat(
-            [x_s2, x_s1, x_era5, m_s2, m_s1, x_static], dim=0
-        ).permute(1, 0, 2, 3)
+        # ======================================================================
+        # FINAL CONTEXT STACK (The Symmetrical Order)
+        # ======================================================================
+        # In order to ensure, that the model can learn a consistent interpretation of channels between context and future features,
+        # the features that are present in both (context and future) are at the same tensor positions in the channel dimension.
+        # So the model can learn to interpret these channels in the same way for both context and future features.
+        # The context only features are then added at the end of the channel dimension.
+
+        # 1. Features that are present in both:
+        # kNDVI, ERA5 variables, LC one-hot, Statics
+        # x_s2[0:1, ...] -> (1, T_ctx, 256, 256)
+        # x_era5         -> (C, T_ctx, 256, 256)
+        # x_static       -> (C, T_ctx, 256, 256)
+        shared_features = torch.cat([x_s2[0:1, :, :, :], x_era5, x_static], dim=0)
+        # Shape: (1 (kNDVI - at first position) + C_era5 + C_static, T_ctx, 256, 256)
+
+        # 2. Features only present in context:
+        # the other S2 variables, S1 variables, Masks
+        # x_s2[1:, ...]  -> (Remaining_Channels, T_ctx, 256, 256)
+        context_only_features = torch.cat([x_s2[1:, :, :, :], x_s1, m_s2, m_s1], dim=0)
+        # Shape: (C_s2-1 + C_s1 + 2, T_ctx, 256, 256)
+
+        # 3. Final Stack:
+        x_context = torch.cat([shared_features, context_only_features], dim=0).permute(
+            1, 0, 2, 3
+        )
+        # Final Shape x_context: (T_ctx, C_total, 256, 256)
         expected_channels = (
-            len(self.s2_vars)
-            + len(self.s1_vars)
+            1  # kNDVI at first position,
             + len(self.era5_vars)
-            + 2
             + len(self.static_vars)
-            + lc_onehot.shape[1]
+            + lc_onehot.shape[0]  # LC one-hot (12)
+            + len(self.s2_vars)
+            - 1  # Remaining S2 channels (without kNDVI)
+            + len(self.s1_vars)  # S1 channels
+            + 2  # Masks (S2, S1)
         )
         self._check_shape(
             x_context,
@@ -432,6 +468,8 @@ class ARCEME_Dataset(Dataset):
                 "x_fut_era5_1d",
                 path,
             )
+            x_fut_era5_1d = torch.clamp(x_fut_era5_1d, min=-3.0, max=3.0) / 3.0
+
             x_fut_era5 = broadcast_era5(x_fut_era5_1d, self.patch_size, self.patch_size)
         else:
             x_fut_era5 = torch.empty(
@@ -460,12 +498,21 @@ class ARCEME_Dataset(Dataset):
 
         # Combine to x_future_feat: (T_target, C_fut, H, W)
         # Concatenate: Climate (C_era5) + ESA One-Hot (12) + Statics (2)
+        # Same order as in context, baseline/prediction of kNDVI will the be added within the model to first position
         x_future_feat = torch.cat(
             [x_fut_era5, lc_fut_onehot, x_stat_fut], dim=0
         ).permute(1, 0, 2, 3)
         expected_channels_fut = (
             len(self.era5_vars) + lc_fut_onehot.shape[0] + len(self.static_vars)
         )
+        # x_future_feat = self._align_future_to_context_structure(
+        #     x_fut_era5, lc_fut_onehot, x_stat_fut, path
+        # )
+        # # S2, S1, Weather, Masks, LC One-Hot, Statics -> C_total
+        # expected_channels_fut = (
+        #     len(self.s2_vars) + len(self.s1_vars) + len(self.era5_vars) +
+        #     2 + 12 + len(self.static_vars)
+        # )
         self._check_shape(
             x_future_feat,
             (self.target_len, expected_channels_fut, self.patch_size, self.patch_size),
@@ -548,7 +595,114 @@ class ARCEME_Dataset(Dataset):
         # Save tiles
         meta = {"top": top, "left": left, "path": path, "cube_id": cube_id}
 
+        # ======================================================================
+        # FINAL CROSS-CHECK ASSERTS (Alignment Context vs Future)
+        # ======================================================================
+        # Wir prüfen einen zufälligen räumlichen Pixel
+        rand_y, rand_x = self.patch_size // 2, self.patch_size // 2
+
+        # 1. Check: ERA5 Alignment
+        # In x_context liegen ERA5-Variablen ab Index 1 (nach kNDVI)
+        # In x_future_feat liegen ERA5-Variablen ab Index 0
+        ctx_era5_sample = x_context[
+            0, 1, rand_y, rand_x
+        ]  # Erster Context-Zeitschritt, erste ERA5 Var
+        # Wir holen den echten Wert aus dem urspünglichen x_era5 Tensor zum Vergleich
+        orig_era5_sample = x_era5[0, 0, rand_y, rand_x]
+        assert torch.allclose(
+            ctx_era5_sample, orig_era5_sample
+        ), "ERA5 im Context ist falsch positioniert!"
+
+        # 2. Check: Static Alignment (z.B. DEM)
+        # DEM ist die erste Variable in self.static_vars
+        # Position in x_context: 1 (kNDVI) + len(era5) + 12 (OneHot) + 0 (DEM)
+        dem_idx_ctx = 1 + len(self.era5_vars) + 12
+        dem_idx_fut = len(self.era5_vars) + 12
+
+        ctx_dem_sample = x_context[0, dem_idx_ctx, rand_y, rand_x]
+        fut_dem_sample = x_future_feat[0, dem_idx_fut, rand_y, rand_x]
+
+        assert torch.allclose(
+            ctx_dem_sample, fut_dem_sample
+        ), f"Statics mismatch! Context Index {dem_idx_ctx} vs Future Index {dem_idx_fut}"
+
+        # 3. Check: LC One-Hot (Klasse 0)
+        # Liegt direkt nach ERA5
+        lc_idx_ctx = 1 + len(self.era5_vars)
+        lc_idx_fut = len(self.era5_vars)
+
+        ctx_lc_sample = x_context[0, lc_idx_ctx, rand_y, rand_x]
+        fut_lc_sample = x_future_feat[0, lc_idx_fut, rand_y, rand_x]
+
+        assert torch.allclose(
+            ctx_lc_sample, fut_lc_sample
+        ), "Landcover One-Hot Alignment fehlerhaft!"
+
+        # 4. Check: kNDVI Consistency
+        # kNDVI im Context (Index 0) muss dem letzten Frame der Baseline entsprechen
+        # (wenn t = context_len - 1)
+        last_ctx_kndvi = x_context[-1, 0, rand_y, rand_x]
+        # In y_target ist kNDVI an Index 0 (Channel 0)
+        target_kndvi_start = y_target[0, 0, rand_y, rand_x]
+
+        # Hinweis: last_ctx_kndvi und target_kndvi_start müssen nicht gleich sein (Zeit schreitet voran),
+        # aber sie sollten im gleichen Wertebereich liegen (Sinnhaftigkeitscheck)
+        if not (torch.isfinite(last_ctx_kndvi) and torch.isfinite(target_kndvi_start)):
+            raise ValueError(f"Non-finite kNDVI values at {path}")
+
         return x_context, x_future_feat, y_target, target_mask, meta, baseline_sample
+
+    # def _align_future_to_context_structure(self, x_fut_era5, lc_fut_onehot, x_stat_fut, path):
+    #     """
+    #     Alignes the future feature tensor to match the channel structure of the context tensor.
+    #     So the model does not have to learn to interpret different channel orders between context and future features.
+    #     Unknown channels (S1, S2, Masks) are filled with zeros.
+    #     """
+    #     # 1. Dummies for S2 and S1 channels in the future (as they are unknown at prediction time)
+    #     # Form: (Channels, T_target, H, W)
+    #     x_s2_dummy = torch.zeros(
+    #         (len(self.s2_vars), self.target_len, self.patch_size, self.patch_size),
+    #         device=x_fut_era5.device
+    #     )
+    #     x_s1_dummy = torch.zeros(
+    #         (len(self.s1_vars), self.target_len, self.patch_size, self.patch_size),
+    #         device=x_fut_era5.device
+    #     )
+
+    #     # 2. Dummies for the masks (mask_s2, mask_s1)
+    #     m_dummy = torch.zeros(
+    #         (2, self.target_len, self.patch_size, self.patch_size),
+    #         device=x_fut_era5.device
+    #     )
+
+    #     # 3. Prepare static features for the future (lc_onehot + statics) in the same order as context:
+    #     # These will be provided for the guided prediction
+    #     # lc_fut_onehot is laready (12, T_target, H, W)
+    #     # x_stat_fut must be (C_stat, T_target, H, W)
+    #     x_static_fut_full = torch.cat([lc_fut_onehot, x_stat_fut], dim=0)
+
+    #     # 4. Built in the exact same channel order as context for the future features:
+    #     # Context Order was: [x_s2, x_s1, x_era5, m_s2, m_s1, x_static]
+    #     x_future_aligned = torch.cat(
+    #         [x_s2_dummy, x_s1_dummy, x_fut_era5, m_dummy, x_static_fut_full],
+    #         dim=0
+    #     )
+
+    #     # 5. Permute to (T_target, C_total, H, W) as x_context
+    #     x_future_aligned = x_future_aligned.permute(1, 0, 2, 3)
+
+    #     # ======================================================================
+    #     # EXTENSIVE ASSERTS
+    #     # ======================================================================
+    #     # Value Checks (Dummies must be 0)
+    #     if not torch.all(x_future_aligned[:, :len(self.s2_vars)] == 0):
+    #          raise ValueError(f"S2 dummy in future is not zero! Path: {path}")
+
+    #     # NaN Check
+    #     if torch.isnan(x_future_aligned).any():
+    #         raise ValueError(f"NaNs in aligned future features detected! Path: {path}")
+
+    #     return x_future_aligned
 
 
 # --- Implementation of Leave-Time-and-Region-Out CV ---

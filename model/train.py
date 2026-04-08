@@ -50,7 +50,8 @@ with open(MODEL_DIR / "config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
 
 # --- Constants & Paths ---
-PROCESSED_DIR = "/scratch/sloeblein/postprocessed"
+# PROCESSED_DIR = "/scratch/sloeblein/postprocessed"
+PROCESSED_DIR = "/net/projects/arceme/vegetation_recovery_prediction/postprocessed"
 CSV_PATH = str(ROOT_DIR / "data_processing" / "data" / "train_test_split.csv")
 EXCLUDE_CSV_PATH = str(ROOT_DIR / "data_processing" / "data" / "excluded_cubes.csv")
 K_FOLDS = 3  # for CV (test for 4 and 5)
@@ -165,6 +166,7 @@ def main():
             era5_vars=v_cfg["era5"],
             static_vars=v_cfg["static"],
             fixed_tiles=val_tiles,
+            use_augmentation=False,
         )
 
         # Create a generator for DataLoader seeding
@@ -240,12 +242,25 @@ def main():
             mode=cfg["training"]["validation"]["monitor_mode"],
         )
 
+        clip_val = (
+            cfg["training"]["gradient_clipping"]["value"]
+            if cfg["training"]["gradient_clipping"]["enabled"]
+            else None
+        )
+        clip_algo = (
+            cfg["training"]["gradient_clipping"]["algorithm"]
+            if cfg["training"]["gradient_clipping"]["enabled"]
+            else "norm"
+        )
+
         # Trainer
         trainer = Trainer(
             accumulate_grad_batches=cfg["training"][
                 "accumulate_grad_batches"
             ],  # Simuliert Batch Size 32 bei realer BS 4
             log_every_n_steps=1,
+            gradient_clip_val=clip_val,  # Nutzt jetzt die 0.5 aus deiner Config
+            gradient_clip_algorithm=clip_algo,
             check_val_every_n_epoch=1,
             max_epochs=cfg["training"]["max_epochs"],
             accelerator=cfg["training"]["accelerator"],
