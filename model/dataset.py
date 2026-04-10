@@ -25,6 +25,7 @@ class ARCEME_Dataset(Dataset):
         target_length,
         patch_size,
         train,
+        config,
         exclude_file=None,  # usually is dealt with already during the split (kept here as safety net)
         s2_vars=None,
         s1_vars=None,
@@ -55,6 +56,7 @@ class ARCEME_Dataset(Dataset):
         self.context_len = context_length
         self.target_len = target_length
         self.patch_size = patch_size
+        self.cfg = config
         self.train = train
         self.fixed_tiles = fixed_tiles
         self.use_augmentation = use_augmentation
@@ -64,6 +66,10 @@ class ARCEME_Dataset(Dataset):
         self.s1_vars = s1_vars or []
         self.era5_vars = era5_vars or []
         self.static_vars = static_vars or []
+
+        # Cube Height and Width
+        self.h = 1000
+        self.w = 1000
 
         # List of all variables for indexing/debugging (order matters!)
         self.all_vars_ordered = (
@@ -77,15 +83,28 @@ class ARCEME_Dataset(Dataset):
     def __len__(self):
         """
         Returns the total number of samples in the dataset.
+
+        For training, the length is calculated to ensure full spatial coverage
+        of the 1000x1000 cubes based on the patch size. For validation,
+        it returns the number of pre-defined fixed tiles.
         """
         if self.fixed_tiles is not None:
             return len(self.fixed_tiles)
 
-        # Upsampling for small datasets to ensure enough iterations per epoch
-        if len(self.cube_paths) < 50:
-            return len(self.cube_paths) * 10
+        # Safety check: Ensure patch size is not larger than the cube dimensions
+        if self.patch_size > self.h or self.patch_size > self.w:
+            raise ValueError(
+                f"Patch size {self.patch_size} exceeds cube dimensions ({self.h}x{self.w})"
+            )
 
-        return len(self.cube_paths)
+        # Calculate number of tiles needed to cover one dimension
+        # e.g., for 1000/128: ceil(7.81) = 8 tiles
+        num_tiles = int(np.ceil(self.h / self.patch_size))
+
+        # Total number of patches needed for full spatial coverage per cube
+        patches_per_cube = num_tiles * num_tiles
+
+        return len(self.cube_paths) * patches_per_cube
 
     def _check_shape(self, tensor, expected_shape, name, path):
         """
@@ -162,7 +181,7 @@ class ARCEME_Dataset(Dataset):
                 f"but got {actual_target_start}. Path: {path}"
             )
 
-    def _filter_cube_paths(self, cube_paths, exclude_file):
+    def _filter_cube_paths(self, cube_paths, exclude_list):
         """
         Filters the list of cube paths based on an exclusion file or list.
         """
@@ -170,16 +189,16 @@ class ARCEME_Dataset(Dataset):
         excluded_ids = set()
 
         # 1. Load excluded IDs from file or list
-        if exclude_file is not None:
-            if isinstance(exclude_file, str) and exclude_file.endswith(".csv"):
-                print(f"DEBUG: Received list with bad cubes at {exclude_file}")
-                df_ex = pd.read_csv(exclude_file)
+        if exclude_list is not None:
+            if isinstance(exclude_list, str) and exclude_list.endswith(".csv"):
+                print(f"DEBUG: Received list with bad cubes at {exclude_list}")
+                df_ex = pd.read_csv(exclude_list)
                 if "cube_id" in df_ex.columns:
                     excluded_ids = set(
                         df_ex["cube_id"].astype(str).str.strip().tolist()
                     )
-            elif isinstance(exclude_file, list):
-                excluded_ids = set([str(i).strip() for i in exclude_file])
+            elif isinstance(exclude_list, (list, set)):
+                excluded_ids = set([str(i).strip() for i in exclude_list])
 
         if not excluded_ids:
             return cube_paths
@@ -195,9 +214,119 @@ class ARCEME_Dataset(Dataset):
             else:
                 pass
 
-        print(f"Filter applied: {len(cube_paths)} -> {len(filtered_paths)} Cubes.")
+        print(
+            f"DATALOADER:Filter applied: {len(cube_paths)} -> {len(filtered_paths)} Cubes."
+        )
 
         return filtered_paths
+
+    def _get_random_patch_coords(self, h, w, ds, max_retries=15):
+        """
+        Finds suitable spatial coordinates (top, left) for a patch using rejection sampling.
+
+        It validates patches based on vegetation presence and temporal data availability
+        in both context and target windows, using thresholds from the configuration.
+
+        Args:
+            h, w (int): Height and width of the source cube (usually 1000, 1000).
+            ds (xr.Dataset): The lazy-loaded Xarray dataset of the current cube.
+            max_retries (int): Maximum number of random attempts before returning the best found patch.
+
+        Returns:
+            tuple: (top, left) coordinate
+        """
+        best_patch = (0, 0)
+        max_score = -1
+
+        # Extract thresholds from config
+        # A timestep is "good" if it has more valid pixels than this ratio
+        valid_pixel_thresh_ctx = self.cfg["data"]["quality_check"][
+            "ctx_min_valid_ratio"
+        ]
+        valid_pixel_thresh_tgt = self.cfg["data"]["quality_check"][
+            "tgt_min_valid_ratio"
+        ]
+
+        # Minimum number of "good" timesteps required
+        min_ctx_steps = int(
+            self.context_len
+            * self.cfg["data"]["quality_check"]["ctx_required_fraction"]
+        )
+        min_tgt_steps = self.cfg["data"]["quality_check"]["tgt_min_timesteps"]
+
+        cutoff_date = pd.to_datetime(ds.attrs["precip_end_date"])
+
+        for i in range(max_retries):
+            # 1. Randomly sample coordinates
+            top = torch.randint(0, h - self.patch_size, (1,)).item()
+            left = torch.randint(0, w - self.patch_size, (1,)).item()
+
+            # 2. Extract masks for the spatial patch (lazy loading)
+            patch_mask_s2 = ds["mask_s2"].isel(
+                y=slice(top, top + self.patch_size),
+                x=slice(left, left + self.patch_size),
+            )
+            patch_is_veg = ds["is_veg"].isel(
+                y=slice(top, top + self.patch_size),
+                x=slice(left, left + self.patch_size),
+            )
+
+            # 3. Combine cloud mask and vegetation mask
+            # Result is 1 only where pixels are visible AND contain vegetation
+            valid_mask = patch_mask_s2 * patch_is_veg
+
+            # 4. Temporal slicing (Context and Target)
+            m_ctx = (
+                valid_mask.sel(time_sentinel_2_l2a=slice(None, cutoff_date))
+                .tail(time_sentinel_2_l2a=self.context_len)
+                .values
+            )
+            m_tgt = (
+                valid_mask.where(
+                    valid_mask.time_sentinel_2_l2a > cutoff_date, drop=True
+                )
+                .head(time_sentinel_2_l2a=self.target_len)
+                .values
+            )
+
+            # Ratio of valid pixels per timestep: Shape (T,)
+            ctx_valid_per_step = m_ctx.mean(axis=(1, 2))
+            tgt_valid_per_step = m_tgt.mean(axis=(1, 2))
+
+            # Count "good" timesteps based on pixel threshold
+            n_good_ctx = np.sum(ctx_valid_per_step >= valid_pixel_thresh_ctx)
+            n_good_tgt = np.sum(tgt_valid_per_step >= valid_pixel_thresh_tgt)
+
+            # 6. Scoring and Selection
+            # Score weights target steps more heavily as they are critical for recovery prediction
+            current_score = (n_good_ctx * 1.0) + (n_good_tgt * 5.0)
+
+            # Check if patch meets hard criteria from config (minimum number of good timesteps)
+            if n_good_ctx >= min_ctx_steps and n_good_tgt >= min_tgt_steps:
+                return top, left
+
+            # Log only if it fails the first time
+            cube_id = ds.attrs["cube_id"]
+            if i == 0:
+                print(
+                    f"DATALOADER: Cube {cube_id}: Patch does not match criteria, retrying..."
+                )
+            elif i % 5 == 0:  # Log every 5th fail to avoid spam
+                print(
+                    f"DATALOADER: Cube {cube_id}: Still looking for a valid patch (Attempt {i+1}/15)..."
+                )
+
+            # Keep track of the best effort if criteria aren't met
+            if current_score > max_score:
+                max_score = current_score
+                best_patch = (top, left)
+
+        # Fallback: Return best effort if no patch met the strict criteria
+        print(
+            f"DEBUG: Cube {cube_id} - No patch met criteria, returning best effort with score:",
+            max_score,
+        )
+        return best_patch
 
     def __getitem__(self, idx):
         """
@@ -206,33 +335,21 @@ class ARCEME_Dataset(Dataset):
         Returns:
             tuple: (x_context, x_future_feat, y_target, target_mask, meta, baseline_sample)
         """
-        # All cubes are 1000 x 1000 pixel
-        h, w = 1000, 1000
         pattern = r"2\d{3}-\d{4}-[A-Z]{3}"
 
         # ======================================================================
         # 1. PATCHING STRATEGY
         # ======================================================================
-        if not self.train:
-            if self.fixed_tiles is not None:
-                tile_info = self.fixed_tiles[idx]
-                path = tile_info["path"]
-                top = tile_info["top"]
-                left = tile_info["left"]
-            else:
-                # FALLBACK: If no fixed_tiles defined always take the middle
-                real_idx = idx % len(self.cube_paths)
-                path = self.cube_paths[real_idx]
-                top = (h - self.patch_size) // 2
-                left = (w - self.patch_size) // 2
+        if not self.train and self.fixed_tiles is not None:
+            tile_info = self.fixed_tiles[idx]
+            path = tile_info["path"]
+            top = tile_info["top"]
+            left = tile_info["left"]
+
         else:
-            # TRAINING: Random cropping from a randomly (through shuffling in the dataloader) selected cube
+            # Select the cube path and get random patch coordinates later
             real_idx = idx % len(self.cube_paths)
             path = self.cube_paths[real_idx]
-            # top = np.random.randint(0, h - self.patch_size)
-            # left = np.random.randint(0, w - self.patch_size)
-            top = torch.randint(0, h - self.patch_size, (1,)).item()
-            left = torch.randint(0, w - self.patch_size, (1,)).item()
 
         # ======================================================================
         # 2. DATA LOADING & SPATIAL SLICING
@@ -245,11 +362,16 @@ class ARCEME_Dataset(Dataset):
             )
             ds = xr.open_zarr(path, consolidated=False)
 
-        # Get cube_id
-        match = re.search(pattern, path)
-        cube_id = match.group(0) if match else "No_ID_Found"
+        # ======================================================================
+        # 3. RANDOM PATCHING WITH QUALITY CHECK (Training only)
+        # ======================================================================
+        if self.train:
+            # Pass ds to filter function
+            top, left = self._get_random_patch_coords(self.h, self.w, ds)
 
-        # Select spatial patch: (time, y, x)
+        # ======================================================================
+        # 4. SPATIAL SLICING
+        # ======================================================================
         ds = ds.isel(
             y=slice(top, top + self.patch_size), x=slice(left, left + self.patch_size)
         )
@@ -262,7 +384,7 @@ class ARCEME_Dataset(Dataset):
             )
 
         # ======================================================================
-        # 3. TIME WINDOW SLICING (Context vs Target)
+        # 5. TIME WINDOW SLICING (Context vs Target)
         # ======================================================================
         cutoff_date = pd.to_datetime(ds.attrs["precip_end_date"])
 
@@ -297,7 +419,7 @@ class ARCEME_Dataset(Dataset):
         ds_target = ds_target.fillna(0.0)  # think about not filling!
 
         # ======================================================================
-        # 4. INPUT CONSTRUCTION (CONTEXT WINDOW)
+        # 6. INPUT CONSTRUCTION (CONTEXT WINDOW)
         # ======================================================================
         # x_s2: (C_s2, T_ctx, H, W)  -- C_s2 will be in the order how I passed the list self.s2_var (Ensure target is at first position!)
         x_s2 = torch.from_numpy(ds_ctx[self.s2_vars].to_array().values).float()
@@ -338,7 +460,7 @@ class ARCEME_Dataset(Dataset):
         )
 
         # ======================================================================
-        # 5. MASKING & VEGETATION LOGIC
+        # 7. MASKING & VEGETATION LOGIC
         # ======================================================================
         # Vegetation mask: (T_ctx, H, W)
         is_veg = torch.from_numpy(ds_ctx["is_veg"].values).float()
@@ -364,7 +486,7 @@ class ARCEME_Dataset(Dataset):
         )
 
         # ======================================================================
-        # 6. LANDCOVER & STATIC FEATURES
+        # 8. LANDCOVER & STATIC FEATURES
         # ======================================================================
         # lc: (T_ctx, H, W) -> lc_onehot: (T_ctx, 12, H, W)
         lc = torch.from_numpy(ds_ctx["ESA_LC"].values).long()
@@ -593,6 +715,9 @@ class ARCEME_Dataset(Dataset):
         ds.close()
 
         # Save tiles
+        # Get cube_id
+        match = re.search(pattern, path)
+        cube_id = match.group(0) if match else "No_ID_Found"
         meta = {"top": top, "left": left, "path": path, "cube_id": cube_id}
 
         # ======================================================================
@@ -707,7 +832,7 @@ class ARCEME_Dataset(Dataset):
 
 # --- Implementation of Leave-Time-and-Region-Out CV ---
 def get_llto_splits(
-    root_dir, csv_path="train_test_split.csv", k=3, show=False, exclude_file=None
+    root_dir, csv_path="train_test_split.csv", k=3, show=False, exclude_list=None
 ):
     """
     Implements k-fold Leave-Location-and-Time-Out (LLTO) splitting according to
@@ -727,6 +852,8 @@ def get_llto_splits(
     df = pd.read_csv(csv_path)
     df = df[df["split"] == "train"].copy()
 
+    print(df["DisNo."].tolist())
+
     # 2. Map file paths
     processed_files = {
         f.replace("_postprocessed.zarr", ""): os.path.join(root_dir, f)
@@ -741,14 +868,12 @@ def get_llto_splits(
     print(f"Matched {len(df)}/{initial_count} cubes from CSV to disk.")
 
     # --- Filter excluded cubes before splitting ---
-    if exclude_file is not None:
-        excluded_ids = []
-        if isinstance(exclude_file, str) and exclude_file.endswith(".csv"):
-            df_ex = pd.read_csv(exclude_file)
-            if "cube_id" in df_ex.columns:
-                excluded_ids = df_ex["cube_id"].astype(str).str.strip().tolist()
-        elif isinstance(exclude_file, list):
-            excluded_ids = [str(i).strip() for i in exclude_file]
+    if exclude_list is not None:
+        if isinstance(exclude_list, str):
+            df_ex = pd.read_csv(exclude_list)
+            excluded_ids = set(df_ex["cube_id"].astype(str).tolist())
+        else:
+            excluded_ids = set(exclude_list)
 
         before_count = len(df)
         df = df[~df["DisNo."].isin(excluded_ids)]
@@ -809,7 +934,7 @@ def get_llto_splits_strict(
     min_val_ratio=0.15,
     show=False,
     save_path=None,
-    exclude_file=None,
+    exclude_list=None,
 ):
     """
     Implements LLTO-CV ensuring a minimum validation size while reporting data usage.
@@ -823,7 +948,7 @@ def get_llto_splits_strict(
         k (int): Number of folds.
         min_val_ratio (float): Minimum percentage of total cubes for validation (e.g., 0.15).
         show (bool): If True, generates the strategy visualization plot.
-        exclude_file (str or list): Path to CSV file or list of excluded cube IDs.
+        exclude_list (set or list): List of excluded cube IDs.
     Returns:
         list: [(train_paths, val_paths), ...] for k folds.
     """
@@ -840,14 +965,12 @@ def get_llto_splits_strict(
     df = df.dropna(subset=["full_path"])
 
     # --- Filter bad cubes before splitting ---
-    if exclude_file is not None:
-        excluded_ids = []
-        if isinstance(exclude_file, str) and exclude_file.endswith(".csv"):
-            df_ex = pd.read_csv(exclude_file)
-            if "cube_id" in df_ex.columns:
-                excluded_ids = df_ex["cube_id"].astype(str).str.strip().tolist()
-        elif isinstance(exclude_file, list):
-            excluded_ids = [str(i).strip() for i in exclude_file]
+    if exclude_list is not None:
+        if isinstance(exclude_list, str):
+            df_ex = pd.read_csv(exclude_list)
+            excluded_ids = set(df_ex["cube_id"].astype(str).tolist())
+        else:
+            excluded_ids = set(exclude_list)
 
         before_count = len(df)
         df = df[~df["DisNo."].isin(excluded_ids)]

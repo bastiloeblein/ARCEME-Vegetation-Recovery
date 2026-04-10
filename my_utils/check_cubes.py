@@ -53,7 +53,10 @@ def check_cube(
         )
 
         if len(ds_ctx.time_sentinel_2_l2a) < context_len:
-            return False, f"Too few ctx timesteps ({len(ds_ctx.time_sentinel_2_l2a)})"
+            return (
+                False,
+                f"Too few ctx timesteps available ({len(ds_ctx.time_sentinel_2_l2a)})",
+            )
 
         # use mask_s2 as quality proxy
         ctx_masks = ds_ctx["mask_s2"].values  # (T, H, W)
@@ -72,7 +75,7 @@ def check_cube(
                 valid_ctx_steps += 1
 
         if valid_ctx_steps < int(context_len * ctx_required_fraction):
-            return False, f"Too few good ctx steps ({valid_ctx_steps})"
+            return False, f"Too few good ctx steps available ({valid_ctx_steps})"
 
         # --- Target ---
         ds_target = ds.where(ds.time_sentinel_2_l2a > cutoff_date, drop=True).head(
@@ -91,7 +94,7 @@ def check_cube(
                 valid_tgt_steps += 1
 
         if valid_tgt_steps < tgt_min_timesteps:
-            return False, f"Too few valid target steps ({valid_tgt_steps})"
+            return False, f"Too few valid target steps available ({valid_tgt_steps})"
 
         return True, "ok"
 
@@ -102,22 +105,16 @@ def check_cube(
         ds.close()
 
 
-def update_exclusion_list(
+def generate_exclusion_list(
     processed_dir,
     exclude_csv_path,
     cfg,
 ):
     """
-    Main function to scan all cubes and update exclusion list.
+    Scans all cubes and creates a FRESH exclusion list based on CURRENT config.
     """
 
-    # Load existing exclusions
-    if os.path.exists(exclude_csv_path):
-        df_ex = pd.read_csv(exclude_csv_path)
-        existing_ids = set(df_ex["cube_id"].astype(str).str.strip())
-    else:
-        df_ex = pd.DataFrame(columns=["cube_id", "reason"])
-        existing_ids = set()
+    new_entries = []
 
     cube_paths = [
         os.path.join(processed_dir, d)
@@ -125,13 +122,10 @@ def update_exclusion_list(
         if d.endswith(".zarr")
     ]
 
-    new_entries = []
+    print(f"🔍 Scanning {len(cube_paths)} cubes with current quality settings...")
 
     for path in tqdm(cube_paths):
         cube_id = extract_cube_id(path)
-
-        if cube_id in existing_ids:
-            continue
 
         is_valid, reason = check_cube(
             path,
@@ -146,13 +140,13 @@ def update_exclusion_list(
 
         if not is_valid:
             new_entries.append({"cube_id": cube_id, "reason": reason})
-            print(f"[BAD] {cube_id}: {reason}")
 
-    if len(new_entries) > 0:
-        df_new = pd.DataFrame(new_entries)
-        df_out = pd.concat([df_ex, df_new], ignore_index=True)
-        df_out = df_out.drop_duplicates(subset="cube_id")
-        df_out.to_csv(exclude_csv_path, index=False)
-        print(f"Added {len(new_entries)} new excluded cubes.")
-    else:
-        print("No new bad cubes found.")
+    # 2. Save the fresh list (overwriting the old one)
+    df_out = pd.DataFrame(new_entries)
+    df_out.to_csv(exclude_csv_path, index=False)
+
+    print(
+        f"✅ Filter complete. {len(new_entries)} cubes excluded. {len(cube_paths)-len(new_entries)} cubes kept."
+    )
+
+    return df_out

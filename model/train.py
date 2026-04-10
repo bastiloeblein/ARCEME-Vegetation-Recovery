@@ -13,7 +13,7 @@ from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers import WandbLogger
-from my_utils.check_cubes import update_exclusion_list
+from my_utils.check_cubes import generate_exclusion_list
 import multiprocessing as mp
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -59,9 +59,27 @@ K_FOLDS = 3  # for CV (test for 4 and 5)
 
 def main():
 
-    # Update list of bad cubes
-    update_exclusion_list(
+    # 1. Generate list of cubes to exclude based on current config quality settings
+    df_excluded_cubes = generate_exclusion_list(
         processed_dir=PROCESSED_DIR, exclude_csv_path=EXCLUDE_CSV_PATH, cfg=cfg
+    )
+    excluded_cube_ids = set(df_excluded_cubes["cube_id"].astype(str).tolist())
+
+    # 2. Get number of used cubes
+    all_zarrs = [d for d in os.listdir(PROCESSED_DIR) if d.endswith(".zarr")]
+    num_total = len(all_zarrs)
+    num_excluded = len(excluded_cube_ids)
+    num_used = num_total - num_excluded
+
+    # 3. Write to config
+    cfg["data"]["stats"] = {
+        "total_cubes_found": num_total,
+        "excluded_cubes": num_excluded,
+        "used_cubes": num_used,
+    }
+
+    print(
+        f"📊 Dataset Stats: Total: {num_total} | Excluded: {num_excluded} | Used: {num_used}"
     )
 
     # Create folder for each run
@@ -105,9 +123,9 @@ def main():
 
     # --- Create CV Splits ---
     all_folds = get_llto_splits(
-        PROCESSED_DIR, CSV_PATH, k=K_FOLDS, show=True, exclude_file=EXCLUDE_CSV_PATH
+        PROCESSED_DIR, CSV_PATH, k=K_FOLDS, show=True, exclude_list=excluded_cube_ids
     )
-    # all_folds = get_llto_splits_strict(PROCESSED_DIR, CSV_PATH, k=K_FOLDS, show=True, save_path=RUN_DIR, exclude_file=EXCLUDE_CSV_PATH)
+    # all_folds = get_llto_splits_strict(PROCESSED_DIR, CSV_PATH, k=K_FOLDS, show=True, save_path=RUN_DIR,exclude_list=excluded_cube_ids)
 
     # --- Log Split Info ---
     split_info = {}
@@ -149,6 +167,7 @@ def main():
             target_length=cfg["data"]["target_length"],
             patch_size=cfg["data"]["patch_size"],
             train=True,
+            config=cfg,
             s2_vars=v_cfg["s2"],
             s1_vars=v_cfg["s1"],
             era5_vars=v_cfg["era5"],
@@ -161,6 +180,7 @@ def main():
             target_length=cfg["data"]["target_length"],
             patch_size=cfg["data"]["patch_size"],
             train=False,
+            config=cfg,
             s2_vars=v_cfg["s2"],
             s1_vars=v_cfg["s1"],
             era5_vars=v_cfg["era5"],
@@ -194,6 +214,8 @@ def main():
         print(
             f"DEBUG: Data loaded - Train batches: {len(train_loader)}, Val batches: {len(val_loader)}"
         )
+        print(f"DEBUG: Training Dataset Length: {len(train_ds)} samples")
+        print(f"DEBUG: Steps per Epoch: {len(train_loader)}")
 
         # Model intialization
         # New model in each fold
@@ -221,8 +243,19 @@ def main():
             config=cfg,  # Speichert deine komplette YAML-Config automatisch!
         )
 
+        # --- LOG EXCLUSION LIST AS ARTIFACT (only for the first fold to avoid redundancy) ---
+        if fold_idx == 0:
+            exclusion_artifact = wandb.Artifact(
+                name=f"exclusion_list_{cfg['experiment_name']}",
+                type="dataset_metadata",
+                description="Cubes excluded based on quality thresholds",
+            )
+            exclusion_artifact.add_file(EXCLUDE_CSV_PATH)
+            wandb_logger.experiment.log_artifact(exclusion_artifact)
+
         # Only save the best model of each fold based on validation loss
-        monitor_key = f"{cfg['training']['validation']['monitor']['split']}_{cfg['training']['validation']['monitor']['metric']}"
+        # monitor_key = f"{cfg['training']['validation']['monitor']['split']}_{cfg['training']['validation']['monitor']['metric']}"
+        monitor_key = cfg["training"]["validation"]["monitor"]["metric"]
         filename = f"best-model-{{epoch:02d}}-{{{monitor_key}:.6f}}"
 
         print(f"DEBUG: Monitor Key for Checkpointing: {monitor_key}")
