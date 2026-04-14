@@ -460,16 +460,30 @@ class ARCEME_Dataset(Dataset):
         is_veg = torch.from_numpy(ds_ctx["is_veg"].values).float()
 
         # S2 / S1 Mask combined with vegetation mask: (1, T_ctx, H, W)
-        m_s2 = (torch.from_numpy(ds_ctx["mask_s2"].values).float() * is_veg).unsqueeze(
-            0
-        )
+        m_s2_base = (
+            torch.from_numpy(ds_ctx["mask_s2"].values).float() * is_veg
+        ).unsqueeze(0)
         m_s1 = (torch.from_numpy(ds_ctx["mask_s1"].values).float() * is_veg).unsqueeze(
             0
         )
+
+        # We split S2 mask in two identical copies
+        # One is for all the s2 channels except kNDVI
+        # One is only for the kNDVI channel
+        # This is done due to architectual reasons in the shared weights model, as in the guided input kNDVI is available, but the other S2 indices aren't
+        m_kndvi = m_s2_base.clone()
+        m_s2_rest = m_s2_base.clone()
+
         self._check_shape(
-            m_s2,
+            m_kndvi,
             (1, self.context_len, self.patch_size, self.patch_size),
-            "m_s2",
+            "m_kndvi",
+            path,
+        )
+        self._check_shape(
+            m_s2_rest,
+            (1, self.context_len, self.patch_size, self.patch_size),
+            "m_s2_rest",
             path,
         )
         self._check_shape(
@@ -545,8 +559,10 @@ class ARCEME_Dataset(Dataset):
         # 2. Features only present in context:
         # the other S2 variables, S1 variables, Masks
         # x_s2[1:, ...]  -> (Remaining_Channels, T_ctx, 256, 256)
-        context_only_features = torch.cat([x_s2[1:, :, :, :], x_s1, m_s2, m_s1], dim=0)
-        # Shape: (C_s2-1 + C_s1 + 2, T_ctx, 256, 256)
+        context_only_features = torch.cat(
+            [x_s2[1:, :, :, :], x_s1, m_kndvi, m_s2_rest, m_s1], dim=0
+        )
+        # Shape: (C_s2-1 + C_s1 + 3, T_ctx, 256, 256)
 
         # 3. Final Stack:
         x_context = torch.cat([shared_features, context_only_features], dim=0).permute(
@@ -561,7 +577,7 @@ class ARCEME_Dataset(Dataset):
             + len(self.s2_vars)
             - 1  # Remaining S2 channels (without kNDVI)
             + len(self.s1_vars)  # S1 channels
-            + 2  # Masks (S2, S1)
+            + 3  # Masks (S1, kNDVI, S2 rest)
         )
         self._check_shape(
             x_context,
@@ -612,23 +628,21 @@ class ARCEME_Dataset(Dataset):
                 (0, self.target_len, self.patch_size, self.patch_size)
             )
 
+        # --- NEW: kNDVI Placeholder ---
+        # Shape: (1 Channel, T_target, H, W) filled with zeroes (to be filled with predictions during training
+        kndvi_placeholder = torch.zeros(
+            (1, self.target_len, self.patch_size, self.patch_size), dtype=torch.float32
+        )
+
         # Combine to x_future_feat: (T_target, C_fut, H, W)
-        # Concatenate: Climate (C_era5) + ESA One-Hot (12) + Statics (2)
-        # Same order as in context, baseline/prediction of kNDVI will the be added within the model to first position
+        # Order: [kNDVI_placeholder (1), ERA5 (C_era5), LC_OneHot (12), Statics (C_static)]
+        # Same order as in context, baseline/prediction of kNDVI will the be filled with the prediction/ baseline (in case of first target timestep)
         x_future_feat = torch.cat(
-            [x_fut_era5, lc_fut_onehot, x_stat_fut], dim=0
+            [kndvi_placeholder, x_fut_era5, lc_fut_onehot, x_stat_fut], dim=0
         ).permute(1, 0, 2, 3)
         expected_channels_fut = (
-            len(self.era5_vars) + lc_fut_onehot.shape[0] + len(self.static_vars)
+            1 + len(self.era5_vars) + lc_fut_onehot.shape[0] + len(self.static_vars)
         )
-        # x_future_feat = self._align_future_to_context_structure(
-        #     x_fut_era5, lc_fut_onehot, x_stat_fut, path
-        # )
-        # # S2, S1, Weather, Masks, LC One-Hot, Statics -> C_total
-        # expected_channels_fut = (
-        #     len(self.s2_vars) + len(self.s1_vars) + len(self.era5_vars) +
-        #     2 + 12 + len(self.static_vars)
-        # )
         self._check_shape(
             x_future_feat,
             (self.target_len, expected_channels_fut, self.patch_size, self.patch_size),
@@ -736,7 +750,7 @@ class ARCEME_Dataset(Dataset):
         # DEM ist die erste Variable in self.static_vars
         # Position in x_context: 1 (kNDVI) + len(era5) + 12 (OneHot) + 0 (DEM)
         dem_idx_ctx = 1 + len(self.era5_vars) + 12
-        dem_idx_fut = len(self.era5_vars) + 12
+        dem_idx_fut = 1 + len(self.era5_vars) + 12
 
         ctx_dem_sample = x_context[0, dem_idx_ctx, rand_y, rand_x]
         fut_dem_sample = x_future_feat[0, dem_idx_fut, rand_y, rand_x]
@@ -748,7 +762,7 @@ class ARCEME_Dataset(Dataset):
         # 3. Check: LC One-Hot (Klasse 0)
         # Liegt direkt nach ERA5
         lc_idx_ctx = 1 + len(self.era5_vars)
-        lc_idx_fut = len(self.era5_vars)
+        lc_idx_fut = 1 + len(self.era5_vars)
 
         ctx_lc_sample = x_context[0, lc_idx_ctx, rand_y, rand_x]
         fut_lc_sample = x_future_feat[0, lc_idx_fut, rand_y, rand_x]
@@ -771,58 +785,6 @@ class ARCEME_Dataset(Dataset):
 
         return x_context, x_future_feat, y_target, target_mask, meta, baseline_sample
 
-    # def _align_future_to_context_structure(self, x_fut_era5, lc_fut_onehot, x_stat_fut, path):
-    #     """
-    #     Alignes the future feature tensor to match the channel structure of the context tensor.
-    #     So the model does not have to learn to interpret different channel orders between context and future features.
-    #     Unknown channels (S1, S2, Masks) are filled with zeros.
-    #     """
-    #     # 1. Dummies for S2 and S1 channels in the future (as they are unknown at prediction time)
-    #     # Form: (Channels, T_target, H, W)
-    #     x_s2_dummy = torch.zeros(
-    #         (len(self.s2_vars), self.target_len, self.patch_size, self.patch_size),
-    #         device=x_fut_era5.device
-    #     )
-    #     x_s1_dummy = torch.zeros(
-    #         (len(self.s1_vars), self.target_len, self.patch_size, self.patch_size),
-    #         device=x_fut_era5.device
-    #     )
-
-    #     # 2. Dummies for the masks (mask_s2, mask_s1)
-    #     m_dummy = torch.zeros(
-    #         (2, self.target_len, self.patch_size, self.patch_size),
-    #         device=x_fut_era5.device
-    #     )
-
-    #     # 3. Prepare static features for the future (lc_onehot + statics) in the same order as context:
-    #     # These will be provided for the guided prediction
-    #     # lc_fut_onehot is laready (12, T_target, H, W)
-    #     # x_stat_fut must be (C_stat, T_target, H, W)
-    #     x_static_fut_full = torch.cat([lc_fut_onehot, x_stat_fut], dim=0)
-
-    #     # 4. Built in the exact same channel order as context for the future features:
-    #     # Context Order was: [x_s2, x_s1, x_era5, m_s2, m_s1, x_static]
-    #     x_future_aligned = torch.cat(
-    #         [x_s2_dummy, x_s1_dummy, x_fut_era5, m_dummy, x_static_fut_full],
-    #         dim=0
-    #     )
-
-    #     # 5. Permute to (T_target, C_total, H, W) as x_context
-    #     x_future_aligned = x_future_aligned.permute(1, 0, 2, 3)
-
-    #     # ======================================================================
-    #     # EXTENSIVE ASSERTS
-    #     # ======================================================================
-    #     # Value Checks (Dummies must be 0)
-    #     if not torch.all(x_future_aligned[:, :len(self.s2_vars)] == 0):
-    #          raise ValueError(f"S2 dummy in future is not zero! Path: {path}")
-
-    #     # NaN Check
-    #     if torch.isnan(x_future_aligned).any():
-    #         raise ValueError(f"NaNs in aligned future features detected! Path: {path}")
-
-    #     return x_future_aligned
-
 
 def broadcast_era5(era5_tensor, target_h, target_w):
     """
@@ -833,7 +795,7 @@ def broadcast_era5(era5_tensor, target_h, target_w):
     return era5_tensor.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, target_h, target_w)
 
 
-def get_val_tiles_auto(cube_paths, patch_size=256, dim_max=1000):
+def get_val_tiles_auto(cube_paths, patch_size, dim_max=1000):
     """
     Generates a deterministic grid of tiles to cover 1000x1000 cubes.
 
