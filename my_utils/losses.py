@@ -9,12 +9,12 @@ def get_loss_from_name(loss_name):
         return MaskedL1Loss()
 
 
-# Losses are currently following the following hierachy:
-# 1. Pixel level: For each of the patch_size x patch_size pixels, calculate the error between prediction and target, then average over all valid pixels (using mask).
-# 2. Timestep level: For each of the target_length timesteps, calculate the pixel-level loss, then average over the target_length timesteps.
-# 3. Patch level: For each patch, calculate the timestep-level loss
-# 4. Batch level: Average the patch-level losses over the batch. e.g. batch_size = 4: BatchLoss = (PatchLoss1 + PatchLoss2 + PatchLoss3 + PatchLoss4) / 4
-# 5. Epoch level:
+# Mathematical hierarchy:
+# 1. Global Summation: Calculate the squared error for every single valid pixel across all patches in the batch and all timesteps. Sum them all together into one massive number.
+# 2. Global Normalization: Count the total number of valid pixels across the entire batch and all timesteps.
+# 3. Final Loss: Divide the massive sum (1) by the total valid pixel count (2).
+
+
 class MaskedMSELoss(nn.Module):
     def __init__(self):
         super(MaskedMSELoss, self).__init__()
@@ -46,10 +46,13 @@ class MaskedL1Loss(nn.Module):
 
     def forward(self, preds, targets, mask):
         """
-        preds:  [B, T, C, H, W] - Model prediction
-        targets: [B, T, C, H, W] - Ground Truth
+        preds:  [B, T, 1, H, W] - Model prediction
+        targets: [B, T, 1, H, W] - Ground Truth
         mask:   [B, T, 1, H, W] - Binary Mask (1 = valid/Vegetation, 0 = clouded/No vegetation)
         """
+        assert (
+            preds.shape == targets.shape == mask.shape
+        ), "Shapes of preds, targets and mask must be the same"
         # 1. Ensure that mask has same type
         mask = mask.to(preds.dtype)
 

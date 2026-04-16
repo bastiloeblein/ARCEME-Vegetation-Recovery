@@ -1,17 +1,20 @@
-experiment_name: "first_SGConvLSTM"
+experiment_name: "New_SGConvLSTM_small_test"
 data:
+  train_data_dir: "/scratch/sloeblein/postprocessed" #/net/projects/arceme/vegetation_recovery_prediction/postprocessed"
+  train_test_split: "data_processing/data/train_test_split.csv"
+  test_data_dir: None # path to test data
   quality_check:
     # Context History
-    ctx_min_valid_ratio: 0.7    # At least X% of all pixels need to be valid
-    ctx_required_fraction: 0.6  # At least X% of timesteps in context have to be "usable"
-    ctx_min_valid_overall: 0.60  # A timestep is usable if it has more than X% valid pixels
+    ctx_min_valid_ratio: 0.05    # At least X% of all pixels need to be valid
+    ctx_required_fraction: 0.25  # At least X% of timesteps in context have to be "usable"
+    ctx_min_valid_overall: 0.1  # A timestep is usable if it has more than X% valid pixels
 
     # Target (Future)
-    tgt_min_valid_ratio: 0.2   # At least x% of valid pixels have to be valid
-    tgt_min_timesteps: 2       # At least X timesteps need to be usable
-  patch_size: 256
-  context_length: 20
-  target_length: 5
+    tgt_min_valid_ratio: 0.05   # At least x% of valid pixels have to be valid
+    tgt_min_timesteps: 1       # At least X timesteps need to be usable
+  patch_size: 128
+  context_length: 30
+  target_length: 6
   variables:
     s2:
       - "kNDVI"
@@ -27,8 +30,8 @@ data:
       - "t2m_max"
       # - "t2mmax_max"
       # - "t2mmin_min"
-      - "tp_dailymean_mean"
-      - "tp_dailymax_mean"
+      # - "tp_dailymean_mean"
+      # - "tp_dailymax_mean"
       - "tp_rollingmax_mean"
       - "pei_30_mean"
       - "pei_90_mean"
@@ -37,43 +40,59 @@ data:
   data_loader:
     num_workers: 4
 training:
+  seed: 42
   optimizer:
     name: "adamW"
-    start_learn_rate: 0.0001
+    start_learn_rate: 0.0003
     warmup:
-      enabled: true
+      enabled: false
       epochs: 5
-    lr_factor: 0.5
-    lr_threshold: 0.001
-    patience: 5
-  batch_size: 2
-  accumulate_grad_batches: 8
+    lr_factor: 0.1
+    lr_threshold: 0.0001
+    patience: 20
+  gradient_clipping:
+    enabled: true
+    value: 2.0
+    algorithm: "norm"
+  batch_size: 4
+  accumulate_grad_batches: 1
   max_epochs: 200
   accelerator: "gpu"
   devices: 1
-  precision: "16-mixed"
+  precision: "16-mixed"  # 32
   use_augmentation: True
   training_loss:
     loss_function: "l1"
-    alpha: 1  # 0.2
-    beta: 0  # 5
-  scaling_factor: 10.0
+    alpha: 1  # 0.2   # Main train loss weight
+    beta: 0 # 5       # Additional delta loss weight
+    gamma: 0 # 2      # Additionnal spatial loss weight (spaital gradient loss)
+  scaling_factor: 1 #10.0
   validation:
-    selection_metric: "nnse"
+    selection_metric: "mse"
     monitor:
-      split: "val"
-      metric: "gm_nnse"
-    monitor_mode: "max"  # "max" for nnse, "min" for loss
-    min_pixel_threshold: 100000 #  Minimum pixel threshold, so a cube is consider for validation metric calculation
+      # split: "val"
+      metric: "val/grand_mean_micro/NNSE" # "gm_nnse"
+    monitor_mode: "max" #"max"  # "max" for nnse, "min" for loss
+    min_pixel_threshold: 0.15 #  Minimum pixel threshold, so a cube is consider for validation metric calculation
+    log_timestep_metrics: False # Whether to log timestep-wise metrics across all cubes during validation/testing
 model:
   model_type: "SGConvLSTM"
+  checkpoint_path: None
   output_channels: 1      # We want to predict 1 channel (kNDVI)
-  hidden_channels:       # if SGEDConvLSTM number of layers and len(hidden_dims) must match - if SGConvLSTM len(hidden_dims) must be: n_layers -1 (the final layer is added within the model (convolution to 1)
-      - 128
-      - 64
-      #- 1
-  n_layers: 3
+  hidden_channels:
+  - 64
+  - 64
+  - 64
+  n_layers: 3 #3 #4
   kernel: 5
   dilation_rate: 1
   baseline: "last_frame"  # Options: "last_frame", "mean_cube", "zeros"
   dropout_prob: 0.3       # dropout to avoid overfitting
+  layer_norm: False       # Whether to use layer normalization
+cross_validation:
+  enabled: True
+  k_folds: 3
+  type: "llto" # llto_strict
+testing:
+  save_tensors: False # Whether to save prediction and target tensors during testing for detailed analysis
+  save_metrics: False # Whether to save computed metrics during testing for detailed analysis

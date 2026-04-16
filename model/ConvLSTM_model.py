@@ -1,12 +1,17 @@
 import os
 import torch
-import wandb
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from model.optimizers import get_opt_from_name
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from my_utils.losses import get_loss_from_name
-from my_utils.visualization import plot_prediction_deltas
+from my_utils.visualization import (
+    plot_full_cube_predictions,
+    plot_prediction_deltas,
+    verify_baseline_consistency,
+)
+import numpy as np
+from collections import defaultdict
 
 # delete
 import matplotlib.pyplot as plt
@@ -37,6 +42,7 @@ class ConvLSTM_Model(pl.LightningModule):
             ],  # Just 1 (as we only predict kNDVI)
             "hidden_dims": hidden_channels_copy,
             "num_layers": cfg["model"]["n_layers"],
+            "cfg": cfg,
             "kernel_size": cfg["model"]["kernel"],
             "dilation": cfg["model"]["dilation_rate"],
             "baseline": cfg["model"]["baseline"],
@@ -51,15 +57,19 @@ class ConvLSTM_Model(pl.LightningModule):
             # Safety check for SGED: Hidden dims list must match number of layers
             assert (
                 len(model_params["hidden_dims"]) == model_params["num_layers"]
-            ), f"SGED requires hidden_dims list length ({len(model_params['hidden_dims'])}) to match n_layers ({model_params['num_layers']})"  # SGED needs additional parameter  decoder_input_dim
+            ), f"SGED requires hidden_dims list length ({len(model_params['hidden_dims'])}) to match n_layers ({model_params['num_layers']})"
             # SGED needs an explicit decoder input dimension calculation
-            decoder_input_channels = cfg["model"]["future_channels"] + 1
+            decoder_input_channels = cfg["model"]["future_channels"]
             self.model = SGEDConvLSTM(
                 decoder_input_dim=decoder_input_channels, **model_params
             )
         else:
             from model.ConvLSTM import SGConvLSTM
 
+            # Safety check for SGConvLSTM:
+            assert (
+                len(model_params["hidden_dims"]) == model_params["num_layers"]
+            ), f"SGConvLSTM requires hidden_dims list length ({len(model_params['hidden_dims'])}) to match n_layers ({model_params['num_layers']})"
             self.model = SGConvLSTM(**model_params)
 
         # 3. 3. Loss & Optimizer configuration
@@ -69,11 +79,8 @@ class ConvLSTM_Model(pl.LightningModule):
         )
         self.alpha = cfg["training"]["training_loss"]["alpha"]
         self.beta = cfg["training"]["training_loss"]["beta"]
-
-        # Just a try:
+        self.gamma = cfg["training"]["training_loss"]["gamma"]
         self.scaling_factor = cfg["training"]["scaling_factor"]
-
-        # self.validation_loss = get_loss_from_name(self.cfg["training"]["validation_loss"])
 
         # Internal storage for validation metrics
         self.validation_step_outputs = []
@@ -116,57 +123,99 @@ class ConvLSTM_Model(pl.LightningModule):
         assert (
             x_fut.size(1) == t_fut
         ), "Future features time dim must match prediction count!"
+        p_size = self.cfg["data"]["patch_size"]
+        assert all(
+            t.size(-1) == p_size and t.size(-2) == p_size
+            for t in [x_ctx, x_fut, y_true, mask, baseline_sample]
+        ), f"All spatial dimensions (H, W) must be {p_size}x{p_size}!"
 
         # Model Prediction
-        y_pred, y_delta_pred, baselines = self(
-            x_ctx, y_true.size(1), x_fut, baseline_sample
-        )
+        y_pred, y_delta_pred, baselines = self(x_ctx, t_fut, x_fut, baseline_sample)
 
-        # Loss Calculation
-        # Primary loss: predicted kNDVI vs true kNDVI
+        # --- 1. Primary Loss ---
+        # predicted kNDVI vs true kNDVI
         train_loss = self.training_loss(preds=y_pred, targets=y_true, mask=mask)
 
-        # Secondary loss (optional): predicted delta vs true delta
-        if self.beta > 0:
-            y_delta_true = y_true - baselines
+        # Initialize secondary losses with zeros to safely use them in combined_loss later
+        train_delta_loss = torch.tensor(0.0).to(self.device)
+        grad_loss = torch.tensor(0.0).to(self.device)
 
-            # test!!
-            # delta_loss = get_loss_from_name("l2")
-            train_delta_loss = self.training_loss(
-                preds=y_delta_pred * self.scaling_factor,
-                targets=y_delta_true * self.scaling_factor,
-                mask=mask,
-            )
+        # --- 2. Delta & Gradient Losses (OPTIONAL:Only calculate if beta OR gamma is active) ---
+        if self.beta > 0 or self.gamma > 0:
 
-            # --- Spatial Gradient Loss (Struktur-Erzwinger) ---
-            # X-Richtung (Horizontal)
-            diff_x_pred = torch.diff(y_delta_pred, dim=-1)
-            diff_x_true = torch.diff(y_delta_true, dim=-1)
-            mask_x = mask[
-                :, :, :, :, :-1
-            ]  # Maske um 1 Pixel kürzen, da diff die Breite um 1 reduziert
-            grad_loss_x = torch.sum(torch.abs(diff_x_pred - diff_x_true) * mask_x) / (
-                mask_x.sum() + 1e-8
-            )
+            # Create mask-sequence: [mask_context_last, mask_true_1, mask_true_2...]
+            # As we assume that last context frame always has valid pixels,
+            # we create a mask with only 1 for first step
+            mask_ctx_last = torch.ones_like(baseline_sample)
+            full_mask_seq = torch.cat([mask_ctx_last.unsqueeze(1), mask], dim=1)
 
-            # Y-Richtung (Vertikal)
-            diff_y_pred = torch.diff(y_delta_pred, dim=-2)
-            diff_y_true = torch.diff(y_delta_true, dim=-2)
-            # Korrekt für 5D [B, T, C, H, W]:
-            mask_y = mask[:, :, :, :-1, :]
-            grad_loss_y = torch.sum(torch.abs(diff_y_pred - diff_y_true) * mask_y) / (
-                mask_y.sum() + 1e-8
-            )
+            # The delta mask is only 1 where NOW and BEFORE were 1, because we can only calculate a delta where we have valid pixels in both timesteps.
+            # mask_delta has shape [B, T_fut, 1, H, W]
+            mask_delta = full_mask_seq[:, 1:] * full_mask_seq[:, :-1]
 
-            # Kombinieren
-            grad_loss = grad_loss_x + grad_loss_y
-            train_delta_loss += 1 * grad_loss
-        else:
-            train_delta_loss = torch.tensor(0.0).to(self.device)
+            # Create GT sequence, starting with the last context frame
+            # [baseline, gt_1, gt_2, gt_3...]
+            gt_with_context = torch.cat([baseline_sample.unsqueeze(1), y_true], dim=1)
 
-        # Combined loss weighted by alpha and beta
-        combined_loss = self.alpha * train_loss + self.beta * train_delta_loss
+            # Now calculate the true physical differences betwwen (T and T -1)
+            y_delta_true = torch.diff(gt_with_context, dim=1)
+            # y_delta_true = y_true - baselines
 
+            # 2a. Temporal Delta Loss (Beta)
+            if self.beta > 0:
+                train_delta_loss = self.training_loss(
+                    preds=y_delta_pred * self.scaling_factor,
+                    targets=y_delta_true * self.scaling_factor,
+                    mask=mask_delta,
+                )
+                self.log(
+                    "train_delta_loss",
+                    train_delta_loss,
+                    on_epoch=True,
+                    batch_size=bs,
+                    sync_dist=True,
+                )
+
+            # 2b. Spatial Gradient Loss (Gamma)
+            if self.gamma > 0:
+                # X-Directional (Horizontal)
+                diff_x_pred = torch.diff(y_delta_pred, dim=-1)
+                diff_x_true = torch.diff(y_delta_true, dim=-1)
+                mask_x = mask_delta[
+                    :, :, :, :, :-1
+                ]  # Maske um 1 Pixel kürzen, da diff die Breite um 1 reduziert
+                grad_loss_x = torch.sum(
+                    torch.abs(diff_x_pred - diff_x_true) * mask_x
+                ) / (mask_x.sum() + 1e-8)
+
+                # Y-Directional (Vertical)
+                diff_y_pred = torch.diff(y_delta_pred, dim=-2)
+                diff_y_true = torch.diff(y_delta_true, dim=-2)
+                # Korrekt für 5D [B, T, C, H, W]:
+                mask_y = mask_delta[:, :, :, :-1, :]
+                grad_loss_y = torch.sum(
+                    torch.abs(diff_y_pred - diff_y_true) * mask_y
+                ) / (mask_y.sum() + 1e-8)
+
+                # Combine Spatial Loss
+                grad_loss = grad_loss_x + grad_loss_y
+                self.log(
+                    "train_grad_only_loss",
+                    grad_loss,
+                    on_epoch=True,
+                    batch_size=bs,
+                    sync_dist=True,
+                )
+
+        # --- 3. Combined Final Loss ---
+        # Multiply each loss by its config weight
+        combined_loss = (
+            (self.alpha * train_loss)
+            + (self.beta * train_delta_loss)
+            + (self.gamma * grad_loss)
+        )
+
+        # --- Logging ---
         self.log(
             "train_loss",
             train_loss,
@@ -175,331 +224,539 @@ class ConvLSTM_Model(pl.LightningModule):
             batch_size=bs,
             sync_dist=True,
         )
-        self.log(
-            "train_delta_loss",
-            train_delta_loss,
-            on_epoch=True,
-            batch_size=bs,
-            sync_dist=True,
-        )
-        self.log(
-            "combined_loss", combined_loss, on_epoch=True, batch_size=bs, sync_dist=True
-        )
+        if self.gamma > 0 or self.beta > 0:
+            self.log(
+                "combined_loss",
+                combined_loss,
+                on_epoch=True,
+                batch_size=bs,
+                sync_dist=True,
+            )
+            if self.beta > 0:
+                self.log(
+                    "loss_ratio_delta_to_main",
+                    train_delta_loss / (train_loss + 1e-8),
+                    on_epoch=True,
+                    batch_size=bs,
+                    sync_dist=True,
+                )
+
+            if self.gamma > 0:
+                self.log(
+                    "loss_ratio_grad_to_main",
+                    grad_loss / (train_loss + 1e-8),
+                    on_epoch=True,
+                    batch_size=bs,
+                    sync_dist=True,
+                )
 
         return combined_loss
 
     def validation_step(self, batch, batch_idx):
         """
-        Validation logic: same as training but collects metrics for epoch end.
+        Validation logic: Performs the forward pass and collects raw predictions and
+        ground truth patches for later stitching and metric calculation on the CPU.
         """
         x_ctx, x_fut, y_true, mask, meta, baseline_sample = batch
-        bs = x_ctx.shape[0]
+        bs, t_fut = x_ctx.shape[0], y_true.shape[1]
 
         # Forward pass
-        y_pred, y_delta_pred, baselines = self(
-            x_ctx, y_true.size(1), x_fut, baseline_sample
-        )
+        y_pred, y_delta_pred, baselines = self(x_ctx, t_fut, x_fut, baseline_sample)
 
-        ### --- PERSISTENCE BASELINE METRICS ---
-        persistence_pred = baselines.expand_as(y_true)
-        diff_base = torch.abs(persistence_pred - y_true) * mask
-        abs_err_base = diff_base.view(bs, -1).sum(dim=1).detach()
-        sq_err_base = (diff_base**2).view(bs, -1).sum(dim=1).detach()
-        y_pred_base_sum = (persistence_pred * mask).view(bs, -1).sum(dim=1).detach()
+        # Create static persistence baseline [B, T, 1, H, W]
+        # baseline_sample is [B, 1, H, W] -> convert to [B, T, 1, H, W] to facilitate metric calculation with y_true and mask
+        # Copies the basleine T times. So calculation of Baseline at timestep t - GT at t can be calculated
+        persistence_baseline = baseline_sample.unsqueeze(1).repeat(1, t_fut, 1, 1, 1)
 
-        # Basic metric collection (ignoring masked pixels)
-        diff = torch.abs(y_pred - y_true) * mask
-        abs_err = (
-            diff.view(bs, -1).sum(dim=1).detach()
-        )  # Reduction per sample in batch (Result has shape [B]) -> if 4 batches in step -> 1 value for each batch -> all errors in the batches are summed
-        sq_err = (
-            (diff**2).view(bs, -1).sum(dim=1).detach()
-        )  # Same principle -> only here squared sum
-        valid_pixels = mask.view(bs, -1).sum(dim=1).detach()  # Number of valid pixels
+        # Extract metadata
+        cube_ids = meta["cube_id"]
+        tops = meta["top"]
+        lefts = meta["left"]
 
-        # Sum of predictions and targets (GT) for calculation of bias
-        y_pred_sum = (y_pred * mask).view(bs, -1).sum(dim=1).detach()
-        y_true_sum = (y_true * mask).view(bs, -1).sum(dim=1).detach()
-
-        # Store outputs for metric calculation at on_validation_epoch_end
-        # Assign each batch to a cube_id -> so cube wise metric calculation is possible  at the end of each epoch
-        ids = meta["cube_id"]
+        # Store raw outputs for stitching at on_validation_epoch_end.
+        # Moving tensors to CPU prevents CUDA Out-Of-Memory errors.
         for i in range(bs):
-            if valid_pixels[i] > 0:
-                self.validation_step_outputs.append(
-                    {
-                        "cube_id": ids[i],
-                        "abs_err": abs_err[i],
-                        "sq_err": sq_err[i],
-                        "y_pred_sum": y_pred_sum[i],
-                        "y_true_sum": y_true_sum[i],
-                        "pixels": valid_pixels[i],
-                        "y_true_raw": y_true[i][mask[i].bool()].detach().cpu(),
-                        # Baseline stats (NEW)
-                        "abs_err_base": abs_err_base[i],
-                        "sq_err_base": sq_err_base[i],
-                        "y_pred_base_sum": y_pred_base_sum[i],
-                    }
-                )
+            self.validation_step_outputs.append(
+                {
+                    "cube_id": cube_ids[i],
+                    "top": tops[i].item(),
+                    "left": lefts[i].item(),
+                    "y_pred": y_pred[i].detach().cpu(),  # Shape: [T, 1, H, W]
+                    "y_true": y_true[i].detach().cpu(),  # Shape: [T, 1, H, W]
+                    "mask": mask[i].detach().cpu(),  # Shape: [T, 1, H, W]
+                    "baseline": persistence_baseline[i]
+                    .detach()
+                    .cpu(),  # Shape: [T, 1, H, W]
+                }
+            )
 
-        # # Log histograms: (maybe delete)
-        # if batch_idx < 3: # Logge Histogramme nur für die ersten 3 Batches
-        #     # Maskiere die Daten, damit nur echte Vegetationspixel im Histogramm landen
-        #     valid_mask = mask.bool()
-        #     preds_filtered = y_pred[valid_mask].detach().cpu().numpy()
-        #     trues_filtered = y_true[valid_mask].detach().cpu().numpy()
+        # --- Visualizations (Keep your existing code here) ---
+        if batch_idx == 0 and self.current_epoch % 5 == 0:
+            # Log histograms every 5 epochs to visualize prediction and ground truth deltas
+            # log_delta_histograms(self, y_pred, y_true, baselines, mask, batch_idx, num_samples=5)
 
-        #     self.logger.experiment.log({
-        #         f"val/hist_pred_batch_{batch_idx}": wandb.Histogram(preds_filtered),
-        #         f"val/hist_true_batch_{batch_idx}": wandb.Histogram(trues_filtered),
-        #     }, commit=False)
+            # Save high quality batch for visualization over the epochs
+            # fix that
+            # store_fixed_val_samples(self, x_ctx, x_fut, y_true, mask, meta, baseline_sample, pixels, number_of_samples=5)
 
-        # Save patches for visualization of predictions over the epochs
-        if self.current_epoch == 0:
-            if not hasattr(self, "fixed_val_batches"):
-                self.fixed_val_batches = []
-                self.seen_cube_ids = set()
-            if len(self.fixed_val_batches) < 3:
-                for i in range(bs):
-                    cid = meta["cube_id"][i]
-                    total_pixels = mask[i].numel()
-                    quality_ratio = valid_pixels[i] / total_pixels
-
-                    # only new cubes are considered with minimum quality
-                    if cid not in self.seen_cube_ids and quality_ratio > 0.6:
-
-                        safe_batch = [
-                            x_ctx.detach().cpu().clone(),
-                            x_fut.detach().cpu().clone(),
-                            y_true.detach().cpu().clone(),
-                            mask.detach().cpu().clone(),
-                            meta,  # No detach needed for dicts!
-                            baseline_sample.detach().cpu().clone(),
-                        ]
-                        self.fixed_val_batches.append(safe_batch)
-                        self.seen_cube_ids.add(cid)
-                        print(
-                            f"DEBUG: Fixed Patch {len(self.fixed_val_batches)} saved for ID {meta['cube_id'][0]}"
-                        )
-
-                        if len(self.fixed_val_batches) >= 3:
-                            break
-
-        # --- BASELINE CONSISTENCY ASSERT ---
-        # This checks if the INITIAL baseline from the data loader is identical
-        # to what we stored.
-        # --- BASELINE CONSISTENCY CHECK & DEBUG ---
-        if hasattr(self, "fixed_val_batches") and self.current_epoch > 0:
-            for i in range(bs):
-                current_id = meta["cube_id"][i]
-
-                for anchor_batch in self.fixed_val_batches:
-                    anchor_meta = anchor_batch[4]
-
-                    # Wir loopen durch den Anker-Batch, um den passenden Patch zu finden
-                    for j in range(len(anchor_meta["cube_id"])):
-                        if (
-                            meta["cube_id"][i] == anchor_meta["cube_id"][j]
-                            and meta["top"][i] == anchor_meta["top"][j]
-                            and meta["left"][i] == anchor_meta["left"][j]
-                        ):
-
-                            # Patch gefunden!
-                            stored_baseline = anchor_batch[-1][j].to(self.device)
-                            current_baseline = baseline_sample[i]
-
-                            diff = torch.abs(current_baseline - stored_baseline)
-                            max_diff = diff.max().item()
-
-                            # --- DEBUG PRINTS (Korrigiert: j statt idx_in_anchor) ---
-                            if (
-                                max_diff > 1e-5 or batch_idx == 0
-                            ):  # Print nur beim Fehler oder einmal am Anfang
-                                print(
-                                    f"\n--- DATA DRIFT DEBUG (Epoch {self.current_epoch}) ---"
-                                )
-                                print(f"Cube ID: {current_id}")
-                                print(
-                                    f"Stored Meta:  Top={anchor_meta['top'][j]}, Left={anchor_meta['left'][j]}"
-                                )
-                                print(
-                                    f"Current Meta: Top={meta['top'][i]}, Left={meta['left'][i]}"
-                                )
-                                print(f"Max Diff in Baseline: {max_diff:.6f}")
-
-                            # --- WANDB VISUALISIERUNG BEI DRIFT ---
-                            if max_diff > 1e-5:
-                                diff_img = diff.squeeze().cpu().numpy()
-                                self.logger.experiment.log(
-                                    {
-                                        f"debug/drift_map_{current_id}": wandb.Image(
-                                            diff_img,
-                                            caption=f"Diff Map (Max: {max_diff:.4f}) Epoch {self.current_epoch}",
-                                        ),
-                                        f"debug/baseline_comparison_{current_id}": [
-                                            wandb.Image(
-                                                stored_baseline.squeeze().cpu().numpy(),
-                                                caption="Stored (Epoch 0)",
-                                            ),
-                                            wandb.Image(
-                                                current_baseline.squeeze()
-                                                .cpu()
-                                                .numpy(),
-                                                caption=f"Current (Epoch {self.current_epoch})",
-                                            ),
-                                        ],
-                                    }
-                                )
-
-                                # Der ultimative Stopp
-                                assert max_diff < 1e-5, (
-                                    f"Baseline Mismatch für {current_id}! "
-                                    f"Diff: {max_diff:.4f}. Check WandB!"
-                                )
-        # if hasattr(self, "fixed_val_batches") and self.current_epoch > 0:
-        #     for i in range(bs):
-        #         if meta["cube_id"][i] == self.fixed_val_batches[0][4]["cube_id"][i]: # ID-Vergleich
-        #              stored_baseline = self.fixed_val_batches[0][-1][i].to(self.device)
-        #              current_baseline = baseline_sample[i]
-        #              diff = torch.abs(current_baseline - stored_baseline).max()
-        #              assert diff < 1e-5, f"Baseline mismatch! Data drift at epoch {self.current_epoch}. Max diff: {diff}"
-
-        # stored_baseline = self.fixed_val_batches[0][-1].to(self.device)
-        # # Compare first sample of current batch with stored first sample
-        # diff = torch.abs(baseline_sample[0] - stored_baseline[0]).max()
-        # # If this fails, your DataLoader shuffles the validation set differently each epoch!
-        # assert diff < 1e-5, f"Baseline mismatch! Data drift at epoch {self.current_epoch}. Max diff: {diff}"
+            # Check if baseline consistency holds for this batch
+            verify_baseline_consistency(self, meta, baseline_sample, batch_idx)
 
     def on_validation_epoch_end(self):
         """
-        Is executed at the end of each epoch. So when the model has seen all data.
-        Aggregate validation metrics across all batches and calculate per-cube statistics.
+        Executed at the end of the epoch. When model has seen all patches for each cube.
+        Stitches patches back into full 1000x1000 cubes, averages overlapping predictions,
+        and calculates pixel-weighted metrics per timestep and per cube.
         """
         if not self.validation_step_outputs:
             return
 
-        # 1. Grouping by Cube IDs
-        # Aggregate errors and pixel counts for each unique cube to get unbiased overall cube metrics
-        cubes = {}
-        for out in self.validation_step_outputs:
-            cid = out["cube_id"]
-            if cid not in cubes:
-                cubes[cid] = {
-                    "abs_err": 0,
-                    "sq_err": 0,
-                    "abs_err_base": 0,
-                    "sq_err_base": 0,
-                    "y_pred_base_sum": 0,
-                    "pixels": 0,
-                    "y_pred_sum": 0,
-                    "y_true_sum": 0,
-                    "y_true_list": [],
-                }
-            for key in [
-                "abs_err",
-                "sq_err",
-                "y_pred_sum",
-                "abs_err_base",
-                "sq_err_base",
-                "y_pred_base_sum",
-                "pixels",
-                "y_true_sum",
-            ]:
-                cubes[cid][key] += out[key]
-            cubes[cid]["y_true_list"].append(out["y_true_raw"])
+        # 1. Group patches by cube_id
+        # test this in notebook!
+        cubes_data = defaultdict(list)
+        for output in self.validation_step_outputs:
+            cubes_data[output["cube_id"]].append(output)
 
-        # 2. Calculate metrics per cube
-        # Using lists to store grand mean components
-        gm_metrics = {
-            k: []
-            for k in [
-                "l1",
-                "mse",
-                "bias",
-                "r2",
-                "nnse",
-                "l1_base",
-                "mse_base",
-                "bias_base",
-                "r2_base",
-                "nnse_base",
-            ]
+        patch_size = self.cfg["data"]["patch_size"]
+        dim_max = 1000  # Cube spatial dimension
+        # Calculate expected number of patches based on patch_size and cube dims
+        expected_patches = int(np.ceil(dim_max / patch_size)) ** 2
+
+        # Flag to save tensors during testing/evaluation
+        # Only when testing
+        try:
+            is_sanity = self.trainer.sanity_checking
+        except RuntimeError:
+            is_sanity = False
+        save_tensors = not is_sanity and self.cfg.get("testing", {}).get(
+            "save_tensors", False
+        )
+
+        # --- Global Storage for Metrics ---
+        # Timestep-wise storage (to see how error evolves over time T)
+        t_fut = self.validation_step_outputs[0]["y_pred"].shape[0]
+        # Global Storage for Pixel-wise (Micro) metrics across all cubes
+        global_ts_stats = {
+            "sq_err": torch.zeros(t_fut),
+            "abs_err": torch.zeros(t_fut),
+            "pixels": torch.zeros(t_fut),
+            "sq_err_base": torch.zeros(t_fut),
+            "abs_err_base": torch.zeros(t_fut),
+            "bias": torch.zeros(t_fut),
+            "bias_base": torch.zeros(t_fut),
+            "y_true": torch.zeros(t_fut),
+            "y_true_sq": torch.zeros(t_fut),
+            "y_pred": torch.zeros(t_fut),
+            "y_pred_base": torch.zeros(t_fut),
         }
 
-        # Define minimum pixel threshold to ensure statistical significance per cube
-        min_pixel_threshold = self.cfg["training"]["validation"].get(
-            "min_pixel_threshold", 10000
-        )  # TODO: This should be handled before.
+        # Storage for Cube-wise (Macro) metrics
+        all_cube_metrics = []
 
-        eps = 1e-8
-        for cid, data in cubes.items():
-            # Skip cubes with insufficient valid data to avoid noisy outliers
-            if data["pixels"] < min_pixel_threshold:
-                continue
+        # 2. Iterate and Stitch each Cube
+        for cube_id, patches in cubes_data.items():
 
-            # Concatenate all pixels of the cube for variance
-            y_all = torch.cat(data["y_true_list"])
-            variance = torch.var(y_all) + eps
+            # --- SAFETY CHECK ---
+            if len(patches) != expected_patches:
+                print(
+                    f"⚠️ WARNING: Cube {cube_id} has {len(patches)} patches, expected {expected_patches}. Stitching might be incomplete!"
+                )
 
-            # --- MODEL METRICS ---
-            mse_m = data["sq_err"] / data["pixels"]
-            r2_m = 1 - (mse_m / variance)
-            gm_metrics["l1"].append(data["abs_err"] / data["pixels"])
-            gm_metrics["mse"].append(mse_m)
-            gm_metrics["bias"].append(
-                (data["y_pred_sum"] - data["y_true_sum"]) / data["pixels"]
+            # Initialize empty tensors for the full 1000x1000 cube
+            # Shape: [T, H, W] (squeeze the channel dimension since C=1)
+            pred_cube = torch.zeros((t_fut, dim_max, dim_max), dtype=torch.float32)
+            count_cube = torch.zeros((t_fut, dim_max, dim_max), dtype=torch.float32)
+
+            true_cube = torch.zeros((t_fut, dim_max, dim_max), dtype=torch.float32)
+            mask_cube = torch.zeros((t_fut, dim_max, dim_max), dtype=torch.float32)
+            base_cube = torch.zeros((t_fut, dim_max, dim_max), dtype=torch.float32)
+
+            # Stitching: Place patches into their spatial position
+            for p in patches:
+                top, left = p["top"], p["left"]
+                bottom, right = top + patch_size, left + patch_size
+
+                # Assert we don't go out of bounds
+                assert (
+                    bottom <= dim_max and right <= dim_max
+                ), f"Patch bounds ({bottom}, {right}) exceed cube max ({dim_max})"
+
+                # Squeeze channel dim for easier handling: [T, 1, H, W] -> [T, H, W]
+                p_pred = p["y_pred"].squeeze(1)
+                p_true = p["y_true"].squeeze(1)
+                p_mask = p["mask"].squeeze(1)
+                p_base = p["baseline"].squeeze(1)
+
+                # Accumulate predictions and count overlaps
+                pred_cube[:, top:bottom, left:right] += p_pred
+                count_cube[:, top:bottom, left:right] += 1.0
+
+                # Overwrite true, mask, and base (they are identical in overlapping regions, no need to average)
+                true_cube[:, top:bottom, left:right] = p_true
+                mask_cube[:, top:bottom, left:right] = p_mask
+                base_cube[:, top:bottom, left:right] = p_base
+
+            # Average the overlapping predictions  (clamp to prevent division by zero, but this should not occur)
+            if count_cube.min() == 0:
+                print(
+                    f"⚠️ WARNING: Cube {cube_id} has uncovered pixels (count=0). This should not happen if patches fully cover the cube."
+                )
+            pred_cube = pred_cube / count_cube.clamp(min=1.0)
+
+            # Create a boolean mask for safe indexing
+            # Check if mask == 1, we use > 0.5 because of floating point inaccurcies, that can arise when sending tensors to CPU and doing the stitching with additions and divisions. So we want to consider a pixel as valid if the mask value is greater than 0.5, which effectively means it was marked as valid in the original data before any floating point issues.
+            valid_mask = mask_cube > 0.5
+
+            # --- FULL CUBE PLOTTING (WITH HIGH QUALITY FILTER) ---
+            # 1. Initialize list with HQ cube ids
+            if not hasattr(self, "fixed_plot_cube_ids"):
+                self.fixed_plot_cube_ids = []
+
+            # 2. Calcualte quality of cubes
+            cube_quality_ratio = valid_mask.sum().item() / valid_mask.numel()
+            should_plot = False
+
+            # 3. In Epoch 0: Get quality of all cubes
+            if self.current_epoch == 0:
+                # 3.1 Save quality ratio for all cubes in epoch 0
+                if not hasattr(self, "cube_scouting_scores"):
+                    self.cube_scouting_scores = {}
+                self.cube_scouting_scores[cube_id] = cube_quality_ratio
+            else:
+                # 3.2 PLOTTING: From Epoch 5 plot 5 best cubes
+                if (
+                    hasattr(self, "fixed_plot_cube_ids")
+                    and cube_id in self.fixed_plot_cube_ids
+                ):
+                    if self.current_epoch % 5 == 0:
+                        should_plot = True
+
+            # 4. Plotting
+            if should_plot:
+                # Plot full cube
+                plot_full_cube_predictions(
+                    true_cube=true_cube,
+                    pred_cube=pred_cube,
+                    base_cube=base_cube,
+                    mask_cube=mask_cube,
+                    cube_id=cube_id,
+                    epoch=self.current_epoch,
+                    save_path=os.path.join(self.cfg["model"]["run_dir"], "plots"),
+                    logger=self.logger,
+                )
+
+            # --- TESTING ONLY: Save Tensors to Disk ---
+            # and dims [T, H, W]
+            if save_tensors:
+                import xarray as xr
+
+                save_dir = os.path.join(self.cfg["model"]["run_dir"], "tensors")
+                os.makedirs(save_dir, exist_ok=True)
+
+                # Create an xarray Dataset for this cube
+                ds_out = xr.Dataset(
+                    {
+                        "pred": (["time", "y", "x"], pred_cube.cpu().numpy()),
+                        "true": (["time", "y", "x"], true_cube.cpu().numpy()),
+                        "mask": (["time", "y", "x"], mask_cube.cpu().numpy()),
+                        "base": (["time", "y", "x"], base_cube.cpu().numpy()),
+                    }
+                )
+                # Als Zarr speichern
+                zarr_path = os.path.join(save_dir, f"{cube_id}.zarr")
+                ds_out.to_zarr(zarr_path, mode="w")
+
+            # 3. Calculate Metrics per Timestep for THIS Cube
+            # Prediction Metrics
+            cube_ts_sq_err, cube_ts_abs_err, cube_ts_bias = (
+                torch.zeros(t_fut),
+                torch.zeros(t_fut),
+                torch.zeros(t_fut),
             )
-            gm_metrics["r2"].append(r2_m)
-            gm_metrics["nnse"].append(1 / (2 - r2_m))
-
-            # --- BASELINE METRICS (NEW) ---
-            mse_b = data["sq_err_base"] / data["pixels"]
-            r2_b = 1 - (mse_b / variance)
-            gm_metrics["l1_base"].append(data["abs_err_base"] / data["pixels"])
-            gm_metrics["mse_base"].append(mse_b)
-            gm_metrics["bias_base"].append(
-                (data["y_pred_base_sum"] - data["y_true_sum"]) / data["pixels"]
+            # Baseline Metrics
+            cube_ts_sq_err_base, cube_ts_abs_err_base, cube_ts_bias_base = (
+                torch.zeros(t_fut),
+                torch.zeros(t_fut),
+                torch.zeros(t_fut),
             )
-            gm_metrics["r2_base"].append(r2_b)
-            gm_metrics["nnse_base"].append(1 / (2 - r2_b))
+            # Valid Pixels
+            cube_ts_pixels = torch.zeros(t_fut)
+            # Tensors necessary for R2 and NNSE calculation
+            cube_ts_y_t, cube_ts_y_t_sq = torch.zeros(t_fut), torch.zeros(t_fut)
 
-        # Log Grand Means
-        for k, values in gm_metrics.items():
-            if values:
-                metric_name = f"val_gm_{k}"
-                self.log(metric_name, torch.stack(values).mean(), sync_dist=True)
+            for t in range(t_fut):
+                m_t = valid_mask[t]
+                pixels_t = m_t.sum().item()
 
-        # Log current learning rate from optimizer
-        opt = self.optimizers()
-        current_lr = opt.param_groups[0]["lr"]
-        self.log("learning_rate", current_lr, prog_bar=True, on_epoch=True)
+                if pixels_t > 0:
+                    y_pred_t = pred_cube[t][m_t]
+                    y_true_t = true_cube[t][m_t]
+                    y_base_t = base_cube[t][m_t]
 
-        ## kann auch raus nur für test
-        # --- Visualizations ---
-        # Log visual samples every X epochs
-        log_interval = 10
-        if self.current_epoch % log_interval == 0 and hasattr(
-            self, "fixed_val_batches"
-        ):
+                    # Model errors
+                    err = y_pred_t - y_true_t
+                    cube_ts_sq_err[t] = (err**2).sum()
+                    cube_ts_abs_err[t] = torch.abs(err).sum()
+                    cube_ts_bias[t] = err.sum()
+
+                    # Baseline errors
+                    err_b = y_base_t - y_true_t
+                    cube_ts_sq_err_base[t] = (err_b**2).sum()
+                    cube_ts_abs_err_base[t] = torch.abs(err_b).sum()
+                    cube_ts_bias_base[t] = err_b.sum()
+
+                    # Stats for R2 and NNSE
+                    cube_ts_pixels[t] = pixels_t
+                    cube_ts_y_t[t] = y_true_t.sum()
+                    cube_ts_y_t_sq[t] = (y_true_t**2).sum()
+
+                    # Add to global timestep stats (Micro)
+                    global_ts_stats["sq_err"][t] += cube_ts_sq_err[t]
+                    global_ts_stats["abs_err"][t] += cube_ts_abs_err[t]
+                    global_ts_stats["bias"][t] += cube_ts_bias[t]
+
+                    global_ts_stats["sq_err_base"][t] += cube_ts_sq_err_base[t]
+                    global_ts_stats["abs_err_base"][t] += cube_ts_abs_err_base[t]
+                    global_ts_stats["bias_base"][t] += cube_ts_bias_base[t]
+
+                    global_ts_stats["pixels"][t] += pixels_t
+                    global_ts_stats["y_true"][t] += cube_ts_y_t[t]
+                    global_ts_stats["y_true_sq"][t] += cube_ts_y_t_sq[t]
+
+            # Calculate Macro Metrics for this specific Cube (aggregated over all T)
+            # (Total squared error across all timesteps / Total valid pixels across all timesteps)
+            # Pixel based weithing (each pixel has same weight) - if one timestep has only few pixels, it will not bias the overall metric for the cube
+            total_cube_pixels = cube_ts_pixels.sum().item()
+            if (
+                total_cube_pixels > 0
+            ):  # Could add min_pixel_threshold here to filter out cubes with too little valid data
+                # Model Metrics
+                cube_mse = cube_ts_sq_err.sum().item() / total_cube_pixels
+                cube_mae = cube_ts_abs_err.sum().item() / total_cube_pixels
+                cube_bias = cube_ts_bias.sum().item() / total_cube_pixels
+
+                # Baseline Metrics
+                cube_mse_base = cube_ts_sq_err_base.sum().item() / total_cube_pixels
+                cube_mae_base = cube_ts_abs_err_base.sum().item() / total_cube_pixels
+                cube_bias_base = cube_ts_bias_base.sum().item() / total_cube_pixels
+
+                cube_skill = 1 - (cube_mse / (cube_mse_base + 1e-8))
+
+                # Variance metrics
+                # Variance/R2 per Cube
+                # --- R² CALCULATION VIA VARIANCE DECOMPOSITION ---
+                # R² = 1 - (SS_res / SS_tot)
+                #
+                # Since we cannot store all pixels, we use the "Sum of Squares Identity":
+                # SS_tot = Σ(y_true - mean_y_true)²  =>  Σ(y_true²) - ( (Σ y_true)² / n )
+                #
+                # 1. sq_err: Residual Sum of Squares (SS_res)  (Σ (y_pred - y_true)²)
+                # 2. y_true_sq_sum:   Sum of squared raw values (Σ y_true²)
+                # 3. y_true_sum:      Sum of raw values (Σ y_true)
+                # 4. pixels:          Total pixel count (n)
+                cube_sst = cube_ts_y_t_sq.sum().item() - (
+                    (cube_ts_y_t.sum().item() ** 2) / total_cube_pixels
+                )
+                cube_r2 = 1 - (cube_ts_sq_err.sum().item() / (cube_sst + 1e-8))
+                cube_r2_base = 1 - (
+                    cube_ts_sq_err_base.sum().item() / (cube_sst + 1e-8)
+                )
+                # Formula from Pellicer-Valero et al. (2025) to convert R² to NNSE: NNSE = 1 / (2 - R²)
+                cube_nnse = 1 / (2 - cube_r2)
+                cube_nnse_base = 1 / (2 - cube_r2_base)
+
+                all_cube_metrics.append(
+                    {
+                        "id": cube_id,
+                        "mse": cube_mse,
+                        "mae": cube_mae,
+                        "bias": cube_bias,
+                        "r2": cube_r2,
+                        "nnse": cube_nnse,
+                        "mse_base": cube_mse_base,
+                        "mae_base": cube_mae_base,
+                        "bias_base": cube_bias_base,
+                        "r2_base": cube_r2_base,
+                        "nnse_base": cube_nnse_base,
+                        "cube_skill": cube_skill,
+                    }
+                )
+
+        # --- 4. Final Aggregation and Logging ---
+        metrics_to_log = {}
+
+        # Log Timestep-wise Micro metrics across all cubes
+        # Every pixel has the same weight, so if a cube has only few pixels in timestep 3, it will not bias the overall metric for that timestep.
+        log_ts = self.cfg["training"]["validation"].get("log_timestep_metrics", False)
+        if log_ts:
+            for t in range(t_fut):
+                p_t = global_ts_stats["pixels"][t].item()
+                if p_t > 0:
+                    mse_t = global_ts_stats["sq_err"][t].item() / p_t
+                    mse_base_t = global_ts_stats["sq_err_base"][t].item() / p_t
+
+                    sst_t = global_ts_stats["y_true_sq"][t].item() - (
+                        (global_ts_stats["y_true"][t].item() ** 2) / p_t
+                    )
+                    r2_t = 1 - (global_ts_stats["sq_err"][t].item() / (sst_t + 1e-8))
+                    r2_base_t = 1 - (mse_base_t * p_t / (sst_t + 1e-8))
+
+                    skill_t = 1 - (mse_t / (mse_base_t + 1e-8))
+
+                    metrics_to_log[f"val/step_{t}/MSE_pixel"] = mse_t
+                    metrics_to_log[f"val/step_{t}/MSE_pixel_base"] = mse_base_t
+                    metrics_to_log[f"val/step_{t}/R2_pixel"] = r2_t
+                    metrics_to_log[f"val/step_{t}/R2_pixel_base"] = r2_base_t
+                    metrics_to_log[f"val/step_{t}/NNSE_pixel"] = 1 / (2 - r2_t)
+                    metrics_to_log[f"val/step_{t}/NNSE_pixel_base"] = 1 / (
+                        2 - r2_base_t
+                    )
+                    metrics_to_log[f"val/step_{t}/Skill_Score_pixel"] = skill_t
+
+        # Grand Mean Micro (Pixel-weighted over ALL cubes and ALL timesteps)
+        # Each valid pixel has the same weight
+        # Answers the question: "How well performs the model on an average pixel across all of earth and all timesteps"
+        # Careful: Bias towards cubes with many valid pixels in later timesteps, as they will dominate the metric if they have more valid pixels than other cubes (e.g. tropical regions with many invalid pixels could be underrepresented, while desert areas with many valid pixels could dominate the metric)
+        g_pix = global_ts_stats["pixels"].sum().item()
+        if g_pix > 0:
+            g_mse = global_ts_stats["sq_err"].sum().item() / g_pix
+            g_mae = global_ts_stats["abs_err"].sum().item() / g_pix
+            g_bias = global_ts_stats["bias"].sum().item() / g_pix
+
+            g_mse_base = global_ts_stats["sq_err_base"].sum().item() / g_pix
+            g_mae_base = global_ts_stats["abs_err_base"].sum().item() / g_pix
+            g_bias_base = global_ts_stats["bias_base"].sum().item() / g_pix
+
+            g_skill = 1 - (g_mse / (g_mse_base + 1e-8))
+
+            g_sst = global_ts_stats["y_true_sq"].sum().item() - (
+                (global_ts_stats["y_true"].sum().item() ** 2) / g_pix
+            )
+            g_r2 = 1 - (global_ts_stats["sq_err"].sum().item() / (g_sst + 1e-8))
+            g_r2_base = 1 - (
+                global_ts_stats["sq_err_base"].sum().item() / (g_sst + 1e-8)
+            )
+
+            metrics_to_log["val/grand_mean_micro/MSE"] = g_mse
+            metrics_to_log["val/grand_mean_micro/MSE_base"] = g_mse_base
+            metrics_to_log["val/grand_mean_micro/MAE"] = g_mae
+            metrics_to_log["val/grand_mean_micro/MAE_base"] = g_mae_base
+            metrics_to_log["val/grand_mean_micro/Bias"] = g_bias
+            metrics_to_log["val/grand_mean_micro/Bias_base"] = g_bias_base
+            metrics_to_log["val/grand_mean_micro/R2"] = g_r2
+            metrics_to_log["val/grand_mean_micro/R2_base"] = g_r2_base
+            metrics_to_log["val/grand_mean_micro/NNSE"] = 1 / (2 - g_r2)
+            metrics_to_log["val/grand_mean_micro/NNSE_base"] = 1 / (2 - g_r2_base)
+            metrics_to_log["val/grand_mean_micro/Skill_Score"] = g_skill
+
+        # Grand Mean Macro (Cube-weighted average)
+        # Here each cube has the same weight (independend of how many valid pixels it has), so cubes with few pixels are not dominated by cubes with many pixels,
+        # Answers the question: "How well perfomrs the model on an average region on earth"
+        # Tropical regions with many invalid pixels could be underrepresented in the micro metrics (as the have fewer valid pixels than dessert areas)
+        if all_cube_metrics:
+            n_c = len(all_cube_metrics)
+            metrics_to_log["val/grand_mean_macro/MSE"] = (
+                sum(c["mse"] for c in all_cube_metrics) / n_c
+            )
+            metrics_to_log["val/grand_mean_macro/MSE_base"] = (
+                sum(c["mse_base"] for c in all_cube_metrics) / n_c
+            )
+            metrics_to_log["val/grand_mean_macro/MAE"] = (
+                sum(c["mae"] for c in all_cube_metrics) / n_c
+            )
+            metrics_to_log["val/grand_mean_macro/Bias"] = (
+                sum(c["bias"] for c in all_cube_metrics) / n_c
+            )
+            metrics_to_log["val/grand_mean_macro/R2"] = (
+                sum(c["r2"] for c in all_cube_metrics) / n_c
+            )
+            metrics_to_log["val/grand_mean_macro/R2_base"] = (
+                sum(c["r2_base"] for c in all_cube_metrics) / n_c
+            )
+            metrics_to_log["val/grand_mean_macro/NNSE"] = (
+                sum(c["nnse"] for c in all_cube_metrics) / n_c
+            )
+            metrics_to_log["val/grand_mean_macro/NNSE_base"] = (
+                sum(c["nnse_base"] for c in all_cube_metrics) / n_c
+            )
+            metrics_to_log["val/grand_mean_macro/Skill_Score"] = (
+                sum(c["cube_skill"] for c in all_cube_metrics) / n_c
+            )
+
+        self.log_dict(metrics_to_log, sync_dist=True)
+        self.validation_step_outputs.clear()
+
+        # --- Plotting - After Epoch 0: Select 5 best cubes ---
+        if self.current_epoch == 0 and hasattr(self, "cube_scouting_scores"):
+            # Sort descending by quality score
+            sorted_cubes = sorted(
+                self.cube_scouting_scores.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+
+            # Extract Top 5 cube IDs for fixed plotting in future epochs
+            self.fixed_plot_cube_ids = [cid for cid, _ in sorted_cubes[:5]]
+
+            # Free memory
+            del self.cube_scouting_scores
+
+        # --- TESTING ONLY: Save Metrics ---
+        has_trainer = getattr(self, "_trainer", None) is not None
+        save_metrics = (
+            not is_sanity and self.cfg.get("testing", {}).get("save_metrics", False)
+            if has_trainer
+            else False
+        )
+
+        if save_metrics:
+            import pandas as pd
+            import json
+
+            metrics_dir = os.path.join(self.cfg["model"]["run_dir"], "metrics")
+            os.makedirs(metrics_dir, exist_ok=True)
+
+            # 1. Save cube-wise Metrics as CSV
+            if all_cube_metrics:
+                df_cubes = pd.DataFrame(all_cube_metrics)
+                csv_path = os.path.join(metrics_dir, "cube_metrics.csv")
+                df_cubes.to_csv(csv_path, index=False)
+
+            # 2. Save aggregated Grand Means and Timestep Metrics as JSON
+            json_path = os.path.join(metrics_dir, "global_metrics.json")
+            with open(json_path, "w") as f:
+                json.dump(metrics_to_log, f, indent=4)
+
+    def log_fixed_validation_samples(self, log_interval=5):
+        """
+        Logs qualitative prediction visualizations for fixed validation samples.
+        Executed every few epochs to monitor model behavior over time.
+        """
+        if self.logger is not None:
+            if not hasattr(self, "fixed_val_batches"):
+                return
+
+            if self.current_epoch % log_interval != 0:
+                return
 
             for i, val_batch in enumerate(self.fixed_val_batches):
 
-                batch_cuda = []
-                for t in val_batch:
-                    if torch.is_tensor(t):
-                        batch_cuda.append(t.to(self.device))
-                    else:
-                        batch_cuda.append(t)
+                # Move batch to device
+                batch_cuda = [
+                    t.to(self.device) if torch.is_tensor(t) else t for t in val_batch
+                ]
 
                 x_ctx, x_fut, y_true, mask, meta, baseline_sample = batch_cuda
 
-                self.visualize_and_log_hidden(batch_cuda)
-
+                # Optional: visualize hidden states
                 with torch.no_grad():
+                    self.visualize_and_log_hidden(batch_cuda)
+
                     y_pred, y_delta_pred, baselines = self(
                         x_ctx, y_true.size(1), x_fut, baseline_sample
                     )
 
+                # Create visualization
                 fig = plot_prediction_deltas(
                     y_true,
                     y_pred,
@@ -513,6 +770,7 @@ class ConvLSTM_Model(pl.LightningModule):
 
                 cube_id = meta["cube_id"][0]
 
+                # Logging
                 if isinstance(self.logger, WandbLogger):
                     self.logger.experiment.log(
                         {
@@ -527,10 +785,8 @@ class ConvLSTM_Model(pl.LightningModule):
                         global_step=self.current_epoch,
                     )
 
+                # Prevent memory leaks
                 plt.close(fig)
-
-        # --- Memory Cleanup ---
-        self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
         """
@@ -543,8 +799,8 @@ class ConvLSTM_Model(pl.LightningModule):
         )
 
         # Monitor metric that should defines validation performance
-        monitor_key = f"{self.cfg['training']['validation']['monitor']['split']}_{self.cfg['training']['validation']['monitor']['metric']}"
-
+        # monitor_key = f"{self.cfg['training']['validation']['monitor']['split']}_{self.cfg['training']['validation']['monitor']['metric']}"
+        monitor_key = self.cfg["training"]["validation"]["monitor"]["metric"]
         # Plateau scheduler
         plateau_scheduler = ReduceLROnPlateau(
             optimizer,
@@ -666,54 +922,71 @@ class ConvLSTM_Model(pl.LightningModule):
             return fig
 
     def visualize_and_log_hidden(self, batch):
-        x_ctx, x_fut, y_true, mask, meta, baseline_sample = batch
 
-        # Deine Funktion von oben aufrufen
-        fig = self.visualize_hidden_states(x_ctx, x_fut, baseline_sample)
+        if self.logger is not None:
+            x_ctx, x_fut, y_true, mask, meta, baseline_sample = batch
 
-        if isinstance(self.logger, WandbLogger):
-            self.logger.experiment.log(
-                {
-                    "Debug/Hidden_States": fig,
-                    "epoch": self.current_epoch,
-                    "global_step": self.global_step,
-                }
-            )
-        else:
-            self.logger.experiment.add_figure(
-                f"Debug/Hidden_States_Epoch_{self.current_epoch}",
-                fig,
-                global_step=self.current_epoch,
-            )
-        plt.close(fig)
+            # Deine Funktion von oben aufrufen
+            fig = self.visualize_hidden_states(x_ctx, x_fut, baseline_sample)
+
+            if isinstance(self.logger, WandbLogger):
+                self.logger.experiment.log(
+                    {
+                        "Debug/Hidden_States": fig,
+                        "epoch": self.current_epoch,
+                        "global_step": self.global_step,
+                    }
+                )
+            else:
+                self.logger.experiment.add_figure(
+                    f"Debug/Hidden_States_Epoch_{self.current_epoch}",
+                    fig,
+                    global_step=self.current_epoch,
+                )
+            plt.close(fig)
 
     def on_after_backward(self):
-        # Diese Methode wird nach jedem Gradienten-Schritt aufgerufen
-        if self.global_step % 50 == 0:  # Alle 10 Schritte loggen, um TB nicht zu fluten
-            # In deiner on_after_backward Methode:
-            grad_dict = {}
-            for name, param in self.named_parameters():
-                if param.grad is not None:
-                    # Nur den Mittelwert der absoluten Gradienten loggen
-                    grad_dict[f"grad_norms/{name}"] = param.grad.abs().mean().item()
-            self.logger.experiment.log(grad_dict, commit=False)
-            # if isinstance(self.logger, WandbLogger):
-            #     for name, param in self.named_parameters():
-            #         if param.grad is not None:
-            #             self.logger.experiment.log(
-            #                 {
-            #                     f"gradients/{name}": wandb.Histogram(
-            #                         param.grad.cpu().detach().numpy()
-            #                     )
-            #                 },
-            #                 commit=False,
-            #             )
-            # else:
-            #     for name, param in self.named_parameters():
-            #         if param.grad is not None:
-            #             self.logger.experiment.add_histogram(
-            #                 f"Gradients/{name}", param.grad, self.global_step
-            #             )
-            #             self.logger.experiment.add_histogram(
-            #                 f"Weights/{name}", param.data, self.global_step
-            #             )
+        if self.logger is not None:
+            # Diese Methode wird nach jedem Gradienten-Schritt aufgerufen
+            if (
+                self.global_step % 50 == 0
+            ):  # Alle 10 Schritte loggen, um TB nicht zu fluten
+                # In deiner on_after_backward Methode:
+                grad_dict = {}
+                for name, param in self.named_parameters():
+                    if param.grad is not None:
+                        # Nur den Mittelwert der absoluten Gradienten loggen
+                        grad_dict[f"grad_norms/{name}"] = param.grad.abs().mean().item()
+                self.logger.experiment.log(grad_dict, commit=False)
+
+    def on_before_optimizer_step(self, optimizer):
+
+        if self.logger is not None:
+            if self.global_step % 50 == 0:
+                grad_dict = {}
+                for name, param in self.named_parameters():
+                    if param.grad is not None:
+                        grad_dict[f"grad_clipped/{name}"] = (
+                            param.grad.abs().mean().item()
+                        )
+                self.logger.experiment.log(grad_dict, commit=False)
+                # if isinstance(self.logger, WandbLogger):
+                #     for name, param in self.named_parameters():
+                #         if param.grad is not None:
+                #             self.logger.experiment.log(
+                #                 {
+                #                     f"gradients/{name}": wandb.Histogram(
+                #                         param.grad.cpu().detach().numpy()
+                #                     )
+                #                 },
+                #                 commit=False,
+                #             )
+                # else:
+                #     for name, param in self.named_parameters():
+                #         if param.grad is not None:
+                #             self.logger.experiment.add_histogram(
+                #                 f"Gradients/{name}", param.grad, self.global_step
+                #             )
+                #             self.logger.experiment.add_histogram(
+                #                 f"Weights/{name}", param.data, self.global_step
+                #             )
