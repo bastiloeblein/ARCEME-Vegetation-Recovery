@@ -85,6 +85,8 @@ class ConvLSTM_Model(pl.LightningModule):
         # Internal storage for validation metrics
         self.validation_step_outputs = []
 
+        self.is_testing_mode = False
+
     def forward(self, x_ctx, prediction_count, non_pred_feat, baseline_sample):
         """
         Standard forward pass through the selected model.
@@ -104,6 +106,9 @@ class ConvLSTM_Model(pl.LightningModule):
         Batch structure: (x_ctx, x_fut, y_true, mask, meta, baseline_sample)
         """
         x_ctx, x_fut, y_true, mask, meta, baseline_sample = batch
+
+        # Raus
+        self.last_mask_sum = mask.sum().item()
 
         # Get batch size and number of prediction steps
         bs = x_ctx.shape[0]
@@ -416,8 +421,14 @@ class ConvLSTM_Model(pl.LightningModule):
             cube_quality_ratio = valid_mask.sum().item() / valid_mask.numel()
             should_plot = False
 
+            # If testing plot all files.
+            is_testing = getattr(self, "is_testing_mode", False)
+
             # 3. In Epoch 0: Get quality of all cubes
-            if self.current_epoch == 0:
+            if is_testing:
+                # 1. EVALUATION: Plot all
+                should_plot = True
+            elif self.current_epoch == 0:
                 # 3.1 Save quality ratio for all cubes in epoch 0
                 if not hasattr(self, "cube_scouting_scores"):
                     self.cube_scouting_scores = {}
@@ -433,12 +444,28 @@ class ConvLSTM_Model(pl.LightningModule):
 
             # 4. Plotting
             if should_plot:
+
+                import xarray as xr
+
+                # 4.1 Get vegetation mask for the cube
+                # Get path
+                cube_path = os.path.join(
+                    self.cfg["data"]["test_data_dir"], f"{cube_id}.zarr"
+                )
+
+                # 2. Cube kurz öffnen und nur is_veg als 1000x1000 Array laden
+                ds_cube = xr.open_zarr(cube_path)
+                is_veg_cube = (
+                    ds_cube["is_veg"].isel(time_sentinel_2_l2a=0).values
+                )  # Shape: [1000, 1000]
+
                 # Plot full cube
                 plot_full_cube_predictions(
                     true_cube=true_cube,
                     pred_cube=pred_cube,
                     base_cube=base_cube,
                     mask_cube=mask_cube,
+                    is_veg_cube=is_veg_cube,
                     cube_id=cube_id,
                     epoch=self.current_epoch,
                     save_path=os.path.join(self.cfg["model"]["run_dir"], "plots"),
@@ -952,41 +979,43 @@ class ConvLSTM_Model(pl.LightningModule):
                 self.global_step % 50 == 0
             ):  # Alle 10 Schritte loggen, um TB nicht zu fluten
                 # In deiner on_after_backward Methode:
+                mask_sum = getattr(self, "last_mask_sum", 1.0)
                 grad_dict = {}
                 for name, param in self.named_parameters():
                     if param.grad is not None:
                         # Nur den Mittelwert der absoluten Gradienten loggen
-                        grad_dict[f"grad_norms/{name}"] = param.grad.abs().mean().item()
-                self.logger.experiment.log(grad_dict, commit=False)
-
-    def on_before_optimizer_step(self, optimizer):
-
-        if self.logger is not None:
-            if self.global_step % 50 == 0:
-                grad_dict = {}
-                for name, param in self.named_parameters():
-                    if param.grad is not None:
-                        grad_dict[f"grad_clipped/{name}"] = (
-                            param.grad.abs().mean().item()
+                        raw_grad_mean = param.grad.abs().mean().item()
+                        # Grad_norm: Es ist die absolute Summe (oder der Durchschnitt) der Gradienten, die an einem Parameter ankommen. Da dein Bias-Parameter im predict_layer auf jeden validen Pixel im Batch wirkt, "hört" er die Schreie von 90.000+ Pixeln gleichzeitig. Er summiert diese Signale auf. Deshalb siehst du 90.000, obwohl jeder Pixel nur mit der Stärke "1" drückt.
+                        # grad_dict[f"grad_norms/{name}"] = raw_grad_mean
+                        # Grad per pixel: Normiert den wert und checkt: what is average gradient signal per pixel?
+                        grad_dict[f"grad_per_pixel/{name}"] = raw_grad_mean / (
+                            mask_sum + 1e-8
                         )
                 self.logger.experiment.log(grad_dict, commit=False)
-                # if isinstance(self.logger, WandbLogger):
-                #     for name, param in self.named_parameters():
-                #         if param.grad is not None:
-                #             self.logger.experiment.log(
-                #                 {
-                #                     f"gradients/{name}": wandb.Histogram(
-                #                         param.grad.cpu().detach().numpy()
-                #                     )
-                #                 },
-                #                 commit=False,
-                #             )
-                # else:
-                #     for name, param in self.named_parameters():
-                #         if param.grad is not None:
-                #             self.logger.experiment.add_histogram(
-                #                 f"Gradients/{name}", param.grad, self.global_step
-                #             )
-                #             self.logger.experiment.add_histogram(
-                #                 f"Weights/{name}", param.data, self.global_step
-                #             )
+
+    # def on_before_optimizer_step(self, optimizer):
+
+    #     if self.logger is not None:
+    #         if self.global_step % 50 == 0:
+    #             grad_dict = {}
+    #             for name, param in self.named_parameters():
+    #                 if param.grad is not None:
+    #                     grad_dict[f"grad_clipped/{name}"] = (
+    #                         param.grad.abs().mean().item()
+    #                     )
+    #             self.logger.experiment.log(grad_dict, commit=False)
+
+    # In deinem TrainingStep oder am Ende der Epoche:
+    def on_train_epoch_end(self):
+        # 1. Den Bias-Wert selbst loggen (Nicht den Gradienten!)
+        # Das zeigt dir, ob der Bias irgendwo bei -50 landet oder gesund bei 0.01 bleibt
+        self.log("weights/predict_layer_bias", self.model.predict_layer.bias.item())
+
+        # 2. Die Standardabweichung der Gewichte im LSTM
+        # Wenn die Std gegen 0 geht, "stirbt" dein Layer (alle Neuronen machen das Gleiche)
+        for i, cell in enumerate(self.model.cell_list):
+            self.log(f"weights/std_cell_{i}", cell.conv.weight.std().item())
+
+        # 3. Aktuelle Learning Rate (Um den Warmup zu verifizieren)
+        current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+        self.log("lr/current", current_lr)

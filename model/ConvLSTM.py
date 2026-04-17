@@ -71,6 +71,11 @@ class ConvLSTMCell(nn.Module):
         )
         # c_cur (Cell State): Is Longterm memory. Internal memory, which stays stable over long periods
 
+        # --- DEBUG: Interne Werte prüfen ---
+        # Wir schauen uns an, wie groß die Zahlen sind, bevor wir rechnen
+        if torch.isnan(h_cur).any() or torch.isnan(c_cur).any():
+            print("⚠️ NAN DETECTED in ConvLSTMCell input!")
+
         # Combine input and previous state/ memory
         combined = torch.cat(
             [input_tensor, h_cur], dim=1
@@ -220,8 +225,8 @@ class SGEDConvLSTM(nn.Module):
         )
 
         # # Maybe delete
-        nn.init.normal_(self.predict_layer.weight, mean=0.0, std=0.05)
-        nn.init.constant_(self.predict_layer.bias, 0.0)
+        # nn.init.normal_(self.predict_layer.weight, mean=0.0, std=0.05)
+        # nn.init.constant_(self.predict_layer.bias, 0.0)
         # nn.init.constant_(self.predict_layer.weight, 0.0)
         # nn.init.constant_(self.predict_layer.bias, 0.0)
 

@@ -10,6 +10,7 @@ def plot_full_cube_predictions(
     pred_cube,
     base_cube,
     mask_cube,
+    is_veg_cube,
     cube_id,
     epoch,
     save_path=None,
@@ -33,7 +34,16 @@ def plot_full_cube_predictions(
             mask_cube,
         )
 
+    # Ensure is_veg is numpy
+    if hasattr(is_veg_cube, "cpu"):
+        is_veg_np = is_veg_cube.detach().cpu().numpy()
+    else:
+        is_veg_np = is_veg_cube
+
     t_steps = y_true_raw.shape[0]
+
+    # Create the static Vegetation mask (1000x1000)
+    m_veg = is_veg_np > 0.5
 
     # Initialize figure
     fig, axes = plt.subplots(6, t_steps, figsize=(t_steps * 3, 18))
@@ -44,37 +54,50 @@ def plot_full_cube_predictions(
         # Masking logic
         m = mask_np[t] > 0.5  # Valid pixels mask for this timestep
 
-        # GT only where valid
+        # --- 1. Masking for Plots ---
+        # GT: Show only where we have valid data (cloud-free & veg)
         gt_plot = np.where(~m, np.nan, y_true_raw[t])
 
-        # Prediction full
-        pred_plot = y_pred_raw[t]
+        # Prediction: Show ALL vegetated pixels (masking of non-veg pixels)
+        pred_plot = np.where(~m_veg, np.nan, y_pred_raw[t])
 
-        # 2. Delta Calculations
+        # --- 2. Delta Calculations ---
         # GT Delta vs Baseline
         d_gt_vs_base = np.where(~m, np.nan, y_true_raw[t] - baselines_raw[t])
 
         # GT Delta Physical (Real change in nature: T - (T-1))
         if t == 0:
             d_gt_phys = np.where(~m, np.nan, y_true_raw[0] - baselines_raw[0])
+            m_delta = m
         else:
             m_prev = mask_np[t - 1] > 0.5
             m_delta = m & m_prev
             d_gt_phys = np.where(~m_delta, np.nan, y_true_raw[t] - y_true_raw[t - 1])
 
-        # Pred Delta (Prediction - Baseline)
-        pred_delta_plot = y_pred_raw[t] - baselines_raw[t]
+        # Pred Delta (Prediction - Baseline): Show for all vegetation pixels, but mask non-veg areas
+        pred_delta_plot = np.where(~m_veg, np.nan, y_pred_raw[t] - baselines_raw[t])
 
-        # Error (Prediction - Ground Truth)
+        # Error (Prediction - Ground Truth): Only possible where GT is valid
         error_plot = np.where(~m, np.nan, y_pred_raw[t] - y_true_raw[t])
 
-        # Calculate Means for valid pixels
-        avg_d_phys = d_gt_phys[m].mean() if m.any() else 0
-        avg_d_vs_base = d_gt_vs_base[m].mean() if m.any() else 0
-        avg_d_pred = pred_delta_plot[m].mean() if m.any() else 0
-        avg_d_error = error_plot[m].mean() if m.any() else 0
+        # --- 3. Calculate FAIR Means ---
+        # Use boolean indexing to extract only the relevant valid pixels for the mean
+        avg_d_phys = (
+            (y_true_raw[t] - (y_true_raw[t - 1] if t > 0 else baselines_raw[0]))[
+                m_delta
+            ].mean()
+            if m_delta.any()
+            else 0
+        )
+        avg_d_vs_base = (y_true_raw[t] - baselines_raw[t])[m].mean() if m.any() else 0
+        avg_d_error = (y_pred_raw[t] - y_true_raw[t])[m].mean() if m.any() else 0
 
-        # --- Plotting ---
+        # Fair Prediction Average: Calculated over ALL vegetation pixels!
+        avg_d_pred = (
+            (y_pred_raw[t] - baselines_raw[t])[m_veg].mean() if m_veg.any() else 0
+        )
+
+        # --- 4. Plotting ---
         axes[0, t].imshow(gt_plot, vmin=0, vmax=1, cmap="YlGn")
         axes[0, t].set_title(f"GT T{t}")
 
