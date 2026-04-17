@@ -3,6 +3,7 @@ import sys
 import json
 import yaml
 import random
+from my_utils.warmup import ConfigWarmupCallback
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -443,9 +444,20 @@ class ARCEMEPipeline:
                 monitor=monitor_key,
                 patience=self.cfg["training"]["optimizer"]["patience"],
                 mode=monitor_mode,
-                min_delta=0.00,  # Val criteria hast to improve by at least this much to reset patience counter
+                min_delta=0.00,  # Val criteria has to improve by at least this much to reset patience counter
                 strict=True,  # might fail (checkt ob metric überhaupt da ist)
             )
+
+            # Define Warmup Callback
+            if (
+                self.cfg["training"]["optimizer"]
+                .get("warmup", {})
+                .get("enabled", False)
+            ):
+                warmup_callback = ConfigWarmupCallback(self.cfg)
+                callbacks = [warmup_callback, checkpoint_callback, early_stop]
+            else:
+                callbacks = [checkpoint_callback, early_stop]
 
             # --- Trainer ---
             trainer = Trainer(
@@ -467,7 +479,7 @@ class ARCEMEPipeline:
                 devices=self.cfg["training"]["devices"],
                 precision=self.cfg["training"]["precision"],
                 logger=wandb_logger,
-                callbacks=[checkpoint_callback, early_stop],
+                callbacks=callbacks,
                 enable_model_summary=True,  # zeigt die architektur und die anzahl der parameter an, könnte hilfreich sein
             )
 
@@ -528,6 +540,8 @@ class ARCEMEPipeline:
 
         model = ConvLSTM_Model.load_from_checkpoint(ckpt_path, cfg=self.cfg)
         model.eval()
+
+        model.is_testing_mode = True
 
         v_cfg = self.cfg["data"]["variables"]
 

@@ -65,4 +65,27 @@ class MaskedL1Loss(nn.Module):
         # 4. Calculate mean over valid pixels (avoid division by zero)
         loss = masked_abs_errors.sum() / (mask.sum() + 1e-8)
 
+        # # --- Deep Debugging ---
+        # with torch.no_grad():
+        #     valid_idx = mask > 0.5 # Boolean Maske
+        #     if valid_idx.any():
+        #         v_preds = preds[valid_idx]
+        #         v_targets = targets[valid_idx]
+        #         v_errors = abs_errors[valid_idx]
+
+        #         # print(f"\n--- 🔎 LOSS DEBUG (Epoche {self.current_epoch}) ---")
+        #         print(f"Valid Pixels: {valid_idx.sum().item()} / {mask.numel()}")
+        #         print(f"Loss (Mean):  {loss.item():.6f}")
+
+        #         print(f"PREDS  | Mean: {v_preds.mean():.4f} | Std: {v_preds.std():.4f} | Min: {v_preds.min():.4f} | Max: {v_preds.max():.4f}")
+        #         print(f"TARGET | Mean: {v_targets.mean():.4f} | Std: {v_targets.std():.4f} | Min: {v_targets.min():.4f} | Max: {v_targets.max():.4f}")
+        #         print(f"ERRORS | Mean: {v_errors.mean():.4f} | Max Error: {v_errors.max():.4f}")
+
+        #         # Check: Ist der Bias-Gradient mathematisch plausibel?
+        #         # Der theoretische L1-Gradient für den Bias ist: (Anzahl_zu_hoch - Anzahl_zu_niedrig) / Gesamt_Valid
+        #         too_high = (v_preds > v_targets).sum().item()
+        #         too_low = (v_preds < v_targets).sum().item()
+        #         expected_bias_grad_direction = (too_high - too_low) / valid_idx.sum().item()
+        #         print(f"Theoretischer Bias-Druck: {expected_bias_grad_direction:.4f} (Sollte zwischen -1 und 1 liegen)")
+
         return loss
