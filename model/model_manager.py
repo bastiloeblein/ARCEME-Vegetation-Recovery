@@ -577,7 +577,8 @@ class ARCEMEPipeline:
             accelerator=self.cfg["training"]["accelerator"], devices=1, logger=False
         )
 
-        results = trainer.validate(model, dataloaders=test_loader)
+        with torch.inference_mode(): # or with torch.no_grad():
+            results = trainer.validate(model, dataloaders=test_loader)
 
         return results
 
