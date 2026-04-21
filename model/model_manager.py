@@ -71,9 +71,14 @@ class ARCEMEPipeline:
         else:
             # Fresh training run
             run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+            exp_name = self.cfg.get("experiment_name", "unnamed_experiment")
+            run_folder_name = f"{exp_name}_{run_timestamp}"
+
             folder_prefix = "test_logs" if self.mode == "eval" else "wand_db_logs"
+
             self.run_dir = str(
-                Path(__file__).resolve().parent / folder_prefix / f"run_{run_timestamp}"
+                Path(__file__).resolve().parent / folder_prefix / run_folder_name
             )
             os.makedirs(self.run_dir, exist_ok=True)
             print(f"📁 Created new Run Directory: {self.run_dir}")
@@ -106,7 +111,7 @@ class ARCEMEPipeline:
             len(self.v_cfg["s2"])
             + len(self.v_cfg["s1"])
             + len(self.v_cfg["era5"])
-            + 3
+            + (3 if len(self.v_cfg["s1"]) > 0 else 2)  # Masks (S1, kNDVI, S2 rest)
             + 12
             + len(self.v_cfg["static"])
         )
@@ -577,7 +582,7 @@ class ARCEMEPipeline:
             accelerator=self.cfg["training"]["accelerator"], devices=1, logger=False
         )
 
-        with torch.inference_mode(): # or with torch.no_grad():
+        with torch.inference_mode():  # or with torch.no_grad():
             results = trainer.validate(model, dataloaders=test_loader)
 
         return results
