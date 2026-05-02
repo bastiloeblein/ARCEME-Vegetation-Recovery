@@ -3,7 +3,6 @@ import xarray as xr
 from scipy.ndimage import uniform_filter
 from typing import Dict
 import gc
-import spyndex
 
 # S1 Bandnamen (VH/VV)
 BAND_MAP_S1: Dict[str, str] = {
@@ -172,50 +171,78 @@ def apply_lee_to_ds(ds, bands=["vv", "vh"], win_size=7, cu=0.25):
     return ds_filtered
 
 
-def normalize_s1_vars(ds, vv_max, vh_max, bands=["vv", "vh"]):
+def transform_and_normalize_s1_to_db(ds, bands=["vv", "vh"]):
     """
-    Normalizes SAR bands to a [0, 1] range using global max values.
-    Ensures that the NaN mask remains unchanged.
+    Transforms linear SAR data to dB scale, clips outliers based on
+    standard physical ranges, and normalizes to [0, 1].
+    Expected input: Lee-filtered linear SAR data.
     """
-    # Map max values for easy access during the loop
-    max_values = {"vv": vv_max, "vh": vh_max}
+    ds_norm = ds.copy()
 
     for band in bands:
-        # 1. Count NaNs before processing for the safety check
-        nans_before = int(ds[band].isnull().sum())
+        # 1. Ensure that there are no negative or zero values before log transformation
+        linear_data = ds_norm[band].clip(min=1e-10)
 
-        # 2. Perform Min-Max scaling (Min is assumed 0 due to previous clipping)
-        # Overwriting the variable directly saves memory
-        ds[band] = (ds[band] / max_values[band]).clip(0, 1).astype(np.float32)
+        # 2. Transform to dB
+        s1_db = 10 * np.log10(linear_data)
 
-        # 3. Validation: Ensure no new NaNs were introduced (e.g., by division errors)
-        nans_after = int(ds[band].isnull().sum())
-        assert (
-            nans_before == nans_after
-        ), f"NaN mismatch in {band}! Before: {nans_before}, After: {nans_after}"
+        # 3. Clip to typical Sentinel-1 dB range (-30 dB to +5 dB)
+        s1_db_clipped = s1_db.clip(min=-30, max=5)
 
-        print(f"Normalized {band} using max {max_values[band]}. NaN check passed.")
+        # 4. Min-Max Normalization to [0, 1]
+        ds_norm[band] = ((s1_db_clipped + 30) / 35).astype(np.float32)  # -30→0, +5→1
 
-    return ds
+        print(
+            f"Band {band}: Converted to dB, clipped [-30, 5], and normalized to [0, 1]."
+        )
+
+    return ds_norm
 
 
-def calculate_SAR_index(ds, index_name, bands_map=BAND_MAP_S1):
-    """Calculates a SAR index via spyndex and returns a raw float32 DataArray."""
+# Older version without dB transformation, just linear normalization based on global max values
+# def normalize_s1_vars(ds, vv_max, vh_max, bands=["vv", "vh"]):
+#     """
+#     Normalizes SAR bands to a [0, 1] range using global max values.
+#     Ensures that the NaN mask remains unchanged.
+#     """
+#     # Map max values for easy access during the loop
+#     max_values = {"vv": vv_max, "vh": vh_max}
 
-    # Map internal spyndex codes (e.g., 'VV', 'VH') to your dataset bands
-    params = {code: ds[band] for code, band in bands_map.items() if band in ds}
+#     for band in bands:
+#         # 1. Count NaNs before processing for the safety check
+#         nans_before = int(ds[band].isnull().sum())
 
-    # Check if all required bands for this specific index are present
-    # spyndex.computeIndex returns a DataArray with an 'index' dimension
-    raw_da = spyndex.computeIndex(index=[index_name], params=params)
+#         # 2. Perform Min-Max scaling (Min is assumed 0 due to previous clipping)
+#         # Overwriting the variable directly saves memory
+#         ds[band] = (ds[band] / max_values[band]).clip(0, 1).astype(np.float32)
 
-    # .squeeze() removes the 'index' dimension, but we must ensure
-    # we don't accidentally squeeze out a valid time or spatial dimension
-    # if it only has a size of 1.
-    if "index" in raw_da.dims:
-        raw_da = raw_da.sel(index=index_name).drop_vars("index")
+#         # 3. Validation: Ensure no new NaNs were introduced (e.g., by division errors)
+#         nans_after = int(ds[band].isnull().sum())
+#         assert (
+#             nans_before == nans_after
+#         ), f"NaN mismatch in {band}! Before: {nans_before}, After: {nans_after}"
 
-    return raw_da.astype("float32")
+#         print(f"Normalized {band} using max {max_values[band]}. NaN check passed.")
+
+#     return ds
+
+# def calculate_SAR_index(ds, index_name, bands_map=BAND_MAP_S1):
+#     """Calculates a SAR index via spyndex and returns a raw float32 DataArray."""
+
+#     # Map internal spyndex codes (e.g., 'VV', 'VH') to your dataset bands
+#     params = {code: ds[band] for code, band in bands_map.items() if band in ds}
+
+#     # Check if all required bands for this specific index are present
+#     # spyndex.computeIndex returns a DataArray with an 'index' dimension
+#     raw_da = spyndex.computeIndex(index=[index_name], params=params)
+
+#     # .squeeze() removes the 'index' dimension, but we must ensure
+#     # we don't accidentally squeeze out a valid time or spatial dimension
+#     # if it only has a size of 1.
+#     if "index" in raw_da.dims:
+#         raw_da = raw_da.sel(index=index_name).drop_vars("index")
+
+#     return raw_da.astype("float32")
 
 
 # def aggregate_s1_causal_nearest(
@@ -302,37 +329,3 @@ def calculate_SAR_index(ds, index_name, bands_map=BAND_MAP_S1):
 #     s2_only = ds.drop_dims(s1_dim)
 
 #     return xr.merge([s2_only, ds_s1_res])
-
-
-# ## This function maybe useful, but probably not
-# def apply_sar_quality_mask(
-#     ds,
-#     threshold_vv=1.0,
-#     threshold_vh=0.5,
-#     veg_classes=[10, 20, 30, 40, 60, 90, 95, 100],
-# ):
-#     """
-#     Identifiziert Pixel, die jemals physikalisch unplausible SAR-Werte hatten
-#     und setzt diese für alle Zeitschritte auf NaN (oder 0).
-#     """
-#     # 1. Wo liegen die Extremwerte? (Einzelne Ausreißer finden)
-#     # Wir nehmen die Originalbänder vor dem Clipping
-#     is_bad_vv = ds.vv > threshold_vv
-#     is_bad_vh = ds.vh > threshold_vh
-#     is_veg = ds.ESA_LC.isel(time_esa_worldcover=0).isin(veg_classes)
-
-#     # 2. 2D-Maske erstellen: Pixel, die IRGENDWANN mal schlecht waren
-#     bad_pixel_mask = (is_bad_vv | is_bad_vh) & is_veg
-
-#     # 3. Das Dataset bereinigen
-#     # Wir setzen diese Pixel im gesamten Cube auf NaN (oder 0, je nach Wunsch)
-#     ds_clean = ds.copy()
-#     ds_clean["vv"] = ds.vv.where(~bad_pixel_mask, np.nan)
-#     ds_clean["vh"] = ds.vh.where(~bad_pixel_mask, np.nan)
-
-#     # Optional: Auch die bereits geclippten Bänder maskieren
-#     if "vv_clipped" in ds:
-#         ds_clean["vv_clipped"] = ds.vv_clipped.where(~bad_pixel_mask, np.nan)
-#         ds_clean["vh_clipped"] = ds.vh_clipped.where(~bad_pixel_mask, np.nan)
-
-#     return ds_clean, bad_pixel_mask

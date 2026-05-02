@@ -27,15 +27,15 @@ NDVI_MAX = 1.0
 
 # S2 Bandnamen für spyndex
 BAND_MAP_S2: Dict[str, str] = {
-    "B": "B02_normalized",
-    "G": "B03_normalized",
-    "R": "B04_normalized",
-    "RE1": "B05_normalized",
-    "RE2": "B06_normalized",
-    "RE3": "B07_normalized",
-    "N": "B08_normalized",
-    "S1": "B11_normalized",
-    "S2": "B12_normalized",
+    "B": "B02",
+    "G": "B03",
+    "R": "B04",
+    "RE1": "B05",
+    "RE2": "B06",
+    "RE3": "B07",
+    "N": "B08",
+    "S1": "B11",
+    "S2": "B12",
 }
 
 
@@ -211,30 +211,31 @@ def report_permanent_nans_for_var(
 
 def clean_and_normalize_bands(ds: xr.Dataset) -> xr.Dataset:
     """
-    Normalizes Sentinel-2 reflectance bands to a 0-1 range and handles
-    physical out-of-bounds values by setting them to NaN.
+    Clips Sentinel-2 reflectance bands to a physical range (e.g., [0, 10000])
+    and normalizes them to a 0-1 range. Preserves existing NaNs.
     """
-
-    # 1. Get list of all bands
+    # 1. Get list of all spectral bands
     all_b_bands = [v for v in ds.data_vars if v.startswith("B") and v[1:].isalnum()]
 
     for band in all_b_bands:
-        # 1. Identify physically valid pixels based on reflectance thresholds
-        is_valid = (ds[band] > REFLECTANCE_MIN) & (ds[band] <= REFLECTANCE_MAX)
+        # Optional: Count how many pixels are being clipped for logging
+        out_of_bounds_lower = (ds[band] < REFLECTANCE_MIN) & ds[band].notnull()
+        out_of_bounds_upper = (ds[band] > REFLECTANCE_MAX) & ds[band].notnull()
 
-        # Count pixels that have data but fall outside the physical bounds (e.g., negative values)
-        num_invalid = (~is_valid) & ds[band].notnull()
-        print(
-            f"Band {band}: {num_invalid.sum().values} pixels out of bounds [set to NaN]"
-        )
+        lower_count = out_of_bounds_lower.sum().compute().item()
+        upper_count = out_of_bounds_upper.sum().compute().item()
 
-        # 2. Mask invalid values and normalize to [0, 1] range
-        ds[f"{band}_normalized"] = (ds[band].where(is_valid) / NORM_FACTOR).astype(
-            "float32"
-        )
+        if lower_count > 0 or upper_count > 0:
+            print(
+                f"Band {band}: Clipped {lower_count} pixels < {REFLECTANCE_MIN} and {upper_count} pixels > {REFLECTANCE_MAX}."
+            )
 
-        # 3. Drop the original bands
-        ds = ds.drop_vars(band)
+        # 2. Clip the values to the specified interval
+        # The clip function naturally ignores NaNs (they remain NaN)
+        clipped_band = ds[band].clip(min=REFLECTANCE_MIN, max=REFLECTANCE_MAX)
+
+        # 3. Normalize to [0, 1] range and cast to float32
+        ds[band] = (clipped_band / NORM_FACTOR).astype("float32")
 
     return ds
 

@@ -297,10 +297,9 @@ def plot_statistical_outliers(ds, time_index, show=True):
         p2, p98 = np.percentile(valid_vals, (2, 98))
         return np.clip((arr - p2) / (p98 - p2), 0, 1)
 
-    # Stelle sicher, dass die Bänder existieren (nach Normalisierung heißen sie meist _normalized)
-    r = stretch(subset.B04_normalized)
-    g = stretch(subset.B03_normalized)
-    b = stretch(subset.B02_normalized)
+    r = stretch(subset.B04)
+    g = stretch(subset.B03)
+    b = stretch(subset.B02)
     rgb = np.dstack([r, g, b])
 
     # 3. Plotting
@@ -543,6 +542,7 @@ def plot_variable_analysis(
 
     return ax
 
+
 def plot_variable_stats(ds, var_name, num_samples=5000):
     """Plots mean, min and max of variable on subsample."""
 
@@ -560,10 +560,9 @@ def plot_variable_stats(ds, var_name, num_samples=5000):
     chosen_y = y_coords[indices]
 
     sampled_data = ds[var_name].isel(
-        x=xr.DataArray(chosen_x, dims="sample"), 
-        y=xr.DataArray(chosen_y, dims="sample")
+        x=xr.DataArray(chosen_x, dims="sample"), y=xr.DataArray(chosen_y, dims="sample")
     )
-    
+
     # 2. Stats over time axis
     mean_val = sampled_data.mean(dim="sample", skipna=True)
     max_val = sampled_data.max(dim="sample", skipna=True)
@@ -572,13 +571,19 @@ def plot_variable_stats(ds, var_name, num_samples=5000):
     # 3. Plot
     fig = plt.figure(figsize=(10, 4))
     plt.plot(mean_val.values, label="Mean", color="green", lw=2)
-    plt.fill_between(range(len(mean_val)), min_val.values, max_val.values, 
-                     color="green", alpha=0.2, label="Min-Max Range")
-    
+    plt.fill_between(
+        range(len(mean_val)),
+        min_val.values,
+        max_val.values,
+        color="green",
+        alpha=0.2,
+        label="Min-Max Range",
+    )
+
     plt.title(f"Temporal Statistics: {var_name}")
     plt.xlabel("Timestep")
     plt.ylabel("Value")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    
+
     return fig
