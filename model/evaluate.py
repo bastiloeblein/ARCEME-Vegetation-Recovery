@@ -120,3 +120,6 @@ if __name__ == "__main__":
 #       - python evaluate.py --ckpt path/to/specific_checkpoint.ckpt
 # Evaluate on a different test set (create a txt file with absolut paths - get from cv splits for example):
 #       - python evaluate.py --run_dir wand_db_logs/run_Dein_Run --fold 2 --type best --test_list val_fold_2.txt
+
+
+# python evaluate.py --run_dir  wand_db_logs/Ablation_SGConvLSTM_big_model --fold 0 --type best --test_list  wand_db_logs/Ablation_SGConvLSTM_big_model/custom_test_list.txt

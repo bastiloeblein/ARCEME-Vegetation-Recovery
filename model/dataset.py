@@ -408,15 +408,36 @@ class ARCEME_Dataset(Dataset):
             path=path,
         )
 
-        # Fill NaNs with 0.0
-        ds_ctx = ds_ctx.fillna(0.0)
-        ds_target = ds_target.fillna(0.0)  # think about not filling!
+        # ----------------------------  Old preprocessing (kept for reference) ----------------------------
+        # # Fill NaNs with 0.0
+        # ds_ctx = ds_ctx.fillna(0.0)
+        # ds_target = ds_target.fillna(0.0)  # think about not filling!
+        # ---------------------------------------------------------------------------------
 
         # ======================================================================
-        # 6. INPUT CONSTRUCTION (CONTEXT WINDOW)
+        # 6. INPUT CONSTRUCTION (CONTEXT WINDOW) & Dynamic masking
         # ======================================================================
+
+        # --- Vegetation Mask ---
+        # (T_ctx, H, W)
+        is_veg = torch.from_numpy(ds_ctx["is_veg"].values).float()
+
+        # --- S2 Features & Masking ---
         # x_s2: (C_s2, T_ctx, H, W)  -- C_s2 will be in the order how I passed the list self.s2_var (Ensure target is at first position!)
         x_s2 = torch.from_numpy(ds_ctx[self.s2_vars].to_array().values).float()
+
+        # Extract only the predictor vars (excluded kNDVI which is the target) for the S2 mask
+        s2_vars_mask = [var for var in self.s2_vars if var != "kNDVI"]
+        x_s2_mask = torch.from_numpy(ds_ctx[s2_vars_mask].to_array().values).float()
+
+        # Dynamic S2 mask: 1 if ALL channels are valid (non-NAN) else 0, multiplied by vegetation mask
+        m_s2 = (~torch.isnan(x_s2_mask)).all(dim=0, keepdim=True).float().unsqueeze(
+            0
+        ) * is_veg
+
+        # Replace NaNs in x_s2 with 0.0 (after creating the mask to avoid losing information about valid pixels)
+        x_s2 = torch.nan_to_num(x_s2, nan=0.0)
+
         self._check_shape(
             x_s2,
             (len(self.s2_vars), self.context_len, self.patch_size, self.patch_size),
@@ -424,55 +445,10 @@ class ARCEME_Dataset(Dataset):
             path,
         )
 
-        # x_s1: (C_s1, T_ctx, H, W)
-        x_s1 = torch.from_numpy(ds_ctx[self.s1_vars].to_array().values).float()
-        self._check_shape(
-            x_s1,
-            (len(self.s1_vars), self.context_len, self.patch_size, self.patch_size),
-            "x_s1",
-            path,
+        # ---  kNDVI target mask ---
+        m_kndvi = (
+            torch.from_numpy(ds_ctx["target_mask"].values).float().unsqueeze(0) * is_veg
         )
-
-        # x_era5_1d: (C_era5, T_ctx) -> Broadcasted: (C_era5, T_ctx, H, W)
-        if len(self.era5_vars) > 0:
-            x_era5_1d = torch.from_numpy(
-                ds_ctx[self.era5_vars].to_array().values
-            ).float()
-
-            x_era5_1d = torch.clamp(x_era5_1d, min=-3.0, max=3.0) / 3.0
-            x_era5 = broadcast_era5(x_era5_1d, self.patch_size, self.patch_size)
-        else:
-            # Erzeuge einen leeren Tensor mit 0 Kanälen, aber passenden anderen Dimensionen
-            x_era5 = torch.empty(
-                (0, self.context_len, self.patch_size, self.patch_size)
-            )
-        self._check_shape(
-            x_era5,
-            (len(self.era5_vars), self.context_len, self.patch_size, self.patch_size),
-            "x_era5",
-            path,
-        )
-
-        # ======================================================================
-        # 7. MASKING & VEGETATION LOGIC
-        # ======================================================================
-        # Vegetation mask: (T_ctx, H, W)
-        is_veg = torch.from_numpy(ds_ctx["is_veg"].values).float()
-
-        # S2 / S1 Mask combined with vegetation mask: (1, T_ctx, H, W)
-        m_s2_base = (
-            torch.from_numpy(ds_ctx["mask_s2"].values).float() * is_veg
-        ).unsqueeze(0)
-        m_s1 = (torch.from_numpy(ds_ctx["mask_s1"].values).float() * is_veg).unsqueeze(
-            0
-        )
-
-        # We split S2 mask in two identical copies
-        # One is for all the s2 channels except kNDVI
-        # One is only for the kNDVI channel
-        # This is done due to architectual reasons in the shared weights model, as in the guided input kNDVI is available, but the other S2 indices aren't
-        m_kndvi = m_s2_base.clone()
-        m_s2_rest = m_s2_base.clone()
 
         self._check_shape(
             m_kndvi,
@@ -480,16 +456,84 @@ class ARCEME_Dataset(Dataset):
             "m_kndvi",
             path,
         )
+
+        # --- S1 Features & Masking ---
+        # x_s1: (C_s1, T_ctx, H, W) # C_s1 usually is 2 as we use vv and vh
+        if self.s1_vars and len(self.s1_vars) > 0:
+
+            x_s1 = torch.from_numpy(ds_ctx[self.s1_vars].to_array().values).float()
+
+            # Dynamic S1 mask: 1 if ALL channels are valid (non-NAN) else 0, multiplied by vegetation mask
+            # m_s1 = (~torch.isnan(x_s1)).all(dim=0, keepdim=True).float() * is_veg
+            # Get mask from dataset
+            m_s1 = (
+                torch.from_numpy(ds_ctx["mask_s1"].values).float() * is_veg
+            ).unsqueeze(0)
+
+            # Replace NaNs in x_s1 with 0.0 (after creating the mask to avoid losing information about valid pixels)
+            x_s1 = torch.nan_to_num(x_s1, nan=0.0)
+
+            # ----------------------------  Old preprocessing (kept for reference) ----------------------------
+            # # Nur laden, wenn die Liste nicht leer ist
+            # # Get linear S1 values first
+            # x_s1_lin = torch.from_numpy(ds_ctx[self.s1_vars].to_array().values).float()
+
+            # # 2. Transform to dB (Epsilon verhindert log(0))
+            # x_s1_db = 10 * torch.log10(x_s1_lin + 1e-6)
+
+            # # 3. Robust Scaling für VV (Index 0)
+            # vv_p1, vv_p99 = -18.7530, -1.6136
+            # vv = torch.clamp(x_s1_db[0], min=vv_p1, max=vv_p99)
+            # vv_norm = 2 * (vv - vv_p1) / (vv_p99 - vv_p1) - 1  # scaled to [-1, 1]
+
+            # # 4. Robust Scaling für VH (Index 1)
+            # vh_p1, vh_p99 = -16.9131, -1.3866
+            # vh = torch.clamp(x_s1_db[1], min=vh_p1, max=vh_p99)
+            # vh_norm = 2 * (vh - vh_p1) / (vh_p99 - vh_p1) - 1
+
+            # x_s1 = torch.stack([vv_norm, vh_norm], dim=0)
+
+            # ---------------------------------------------------------------------------
+
+            self._check_shape(
+                x_s1,
+                (len(self.s1_vars), self.context_len, self.patch_size, self.patch_size),
+                "x_s1",
+                path,
+            )
+        else:
+            # If no S1 vars are specified
+            x_s1 = None
+            m_s1 = None
+
+        # x_era5_1d: (C_era5, T_ctx) -> Broadcasted: (C_era5, T_ctx, H, W)
+        if len(self.era5_vars) > 0:
+            x_era5_1d = torch.from_numpy(
+                ds_ctx[self.era5_vars].to_array().values
+            ).float()
+
+            # --- SAFETY CHECK: ERA5 NaNs ---
+            nan_count_era5 = torch.isnan(x_era5_1d).sum().item()
+            if nan_count_era5 > 0:
+                print(
+                    f"⚠️ WARNING: Found {nan_count_era5} NaNs in ERA5 Context Data at path: {path}"
+                )
+
+            x_era5_1d = torch.nan_to_num(x_era5_1d, nan=0.0)
+
+            # -----------------------------  Old preprocessing (kept for reference) ----------------------------
+            # x_era5_1d = torch.clamp(x_era5_1d, min=-3.0, max=3.0) / 3.0
+            # --------------------------------------------------------------------------------
+            x_era5 = broadcast_era5(x_era5_1d, self.patch_size, self.patch_size)
+        else:
+            # If no ERA5 vars are specified
+            x_era5 = torch.empty(
+                (0, self.context_len, self.patch_size, self.patch_size)
+            )
         self._check_shape(
-            m_s2_rest,
-            (1, self.context_len, self.patch_size, self.patch_size),
-            "m_s2_rest",
-            path,
-        )
-        self._check_shape(
-            m_s1,
-            (1, self.context_len, self.patch_size, self.patch_size),
-            "m_s1",
+            x_era5,
+            (len(self.era5_vars), self.context_len, self.patch_size, self.patch_size),
+            "x_era5",
             path,
         )
 
@@ -512,6 +556,15 @@ class ARCEME_Dataset(Dataset):
             x_stat_raw = torch.from_numpy(
                 ds_ctx[self.static_vars].to_array().values
             ).float()
+
+            # --- SAFETY CHECK: Static NaNs ---
+            nan_count_static = torch.isnan(x_stat_raw).sum().item()
+            if nan_count_static > 0:
+                print(
+                    f"⚠️ WARNING: Found {nan_count_static} NaNs in Static Features at path: {path}"
+                )
+
+            x_stat_raw = torch.nan_to_num(x_stat_raw, nan=0.0)
         else:
             x_stat_raw = torch.empty(
                 (0, self.context_len, self.patch_size, self.patch_size)
@@ -559,10 +612,14 @@ class ARCEME_Dataset(Dataset):
         # 2. Features only present in context:
         # the other S2 variables, S1 variables, Masks
         # x_s2[1:, ...]  -> (Remaining_Channels, T_ctx, 256, 256)
-        context_only_features = torch.cat(
-            [x_s2[1:, :, :, :], x_s1, m_kndvi, m_s2_rest, m_s1], dim=0
-        )
-        # Shape: (C_s2-1 + C_s1 + 3, T_ctx, 256, 256)
+        if x_s1 is not None:
+            context_only_features = torch.cat(
+                [x_s2[1:, :, :, :], x_s1, m_kndvi, m_s2, m_s1], dim=0
+            )
+            num_mask_channels = 3  # m_kndvi, m_s2_rest, m_s1
+        else:
+            context_only_features = torch.cat([x_s2[1:, :, :, :], m_kndvi, m_s2], dim=0)
+            num_mask_channels = 2  # m_kndvi, m_s2_rest
 
         # 3. Final Stack:
         x_context = torch.cat([shared_features, context_only_features], dim=0).permute(
@@ -577,7 +634,7 @@ class ARCEME_Dataset(Dataset):
             + len(self.s2_vars)
             - 1  # Remaining S2 channels (without kNDVI)
             + len(self.s1_vars)  # S1 channels
-            + 3  # Masks (S1, kNDVI, S2 rest)
+            + num_mask_channels  # Masks (S1, kNDVI, S2 rest)
         )
         self._check_shape(
             x_context,
@@ -594,13 +651,24 @@ class ARCEME_Dataset(Dataset):
             x_fut_era5_1d = torch.from_numpy(
                 ds_target[self.era5_vars].to_array().values
             ).float()
+
+            # --- SAFETY CHECK: Future ERA5 NaNs ---
+            nan_count_fut_era5 = torch.isnan(x_fut_era5_1d).sum().item()
+            if nan_count_fut_era5 > 0:
+                print(
+                    f"⚠️ WARNING: Found {nan_count_fut_era5} NaNs in ERA5 FUTURE Data at path: {path}"
+                )
+
+            x_fut_era5_1d = torch.nan_to_num(x_fut_era5_1d, nan=0.0)
             self._check_shape(
                 x_fut_era5_1d,
                 (len(self.era5_vars), self.target_len),
                 "x_fut_era5_1d",
                 path,
             )
-            x_fut_era5_1d = torch.clamp(x_fut_era5_1d, min=-3.0, max=3.0) / 3.0
+            # ------------------------------------- Old preprocessing (kept for reference) -------------------------------------
+            # x_fut_era5_1d = torch.clamp(x_fut_era5_1d, min=-3.0, max=3.0) / 3.0
+            # ---------------------------------------------------------------------------------------------------------------
 
             x_fut_era5 = broadcast_era5(x_fut_era5_1d, self.patch_size, self.patch_size)
         else:
@@ -623,6 +691,15 @@ class ARCEME_Dataset(Dataset):
             x_stat_fut = torch.from_numpy(
                 ds_target[self.static_vars].to_array().values
             ).float()
+
+            # --- SAFETY CHECK: Future Static NaNs ---
+            nan_count_fut_static = torch.isnan(x_stat_fut).sum().item()
+            if nan_count_fut_static > 0:
+                print(
+                    f"⚠️ WARNING: Found {nan_count_fut_static} NaNs in Future Static Features at path: {path}"
+                )
+
+            x_stat_fut = torch.nan_to_num(x_stat_fut, nan=0.0)
         else:
             x_stat_fut = torch.empty(
                 (0, self.target_len, self.patch_size, self.patch_size)
@@ -655,6 +732,7 @@ class ARCEME_Dataset(Dataset):
         # ======================================================================
         # y_target: (T_target, 1, H, W)
         y_target = torch.from_numpy(ds_target["kNDVI"].values).unsqueeze(1).float()
+        y_target = torch.nan_to_num(y_target, nan=0.0)
         self._check_shape(
             y_target,
             (self.target_len, 1, self.patch_size, self.patch_size),
@@ -678,14 +756,14 @@ class ARCEME_Dataset(Dataset):
         # 9. BASELINE LOGIC (Last-Frame)
         # ======================================================================
         context_kndvi = ds_ctx.kNDVI.values
-        mask_s2 = ds_ctx.mask_s2.values
+        mask_target = ds_ctx.target_mask.values
 
         last_available = np.zeros((self.patch_size, self.patch_size), dtype=np.float32)
         found = np.zeros((self.patch_size, self.patch_size), dtype=bool)
 
         # Loop through context timesteps in reverse to find the last valid kNDVI pixel
         for t in reversed(range(context_kndvi.shape[0])):
-            valid = (mask_s2[t] == 1) & (~found)
+            valid = (mask_target[t] == 1) & (~found)
             last_available[valid] = context_kndvi[t][valid]
             found[valid] = True
             if found.all():
@@ -737,14 +815,15 @@ class ARCEME_Dataset(Dataset):
         # 1. Check: ERA5 Alignment
         # In x_context liegen ERA5-Variablen ab Index 1 (nach kNDVI)
         # In x_future_feat liegen ERA5-Variablen ab Index 0
-        ctx_era5_sample = x_context[
-            0, 1, rand_y, rand_x
-        ]  # Erster Context-Zeitschritt, erste ERA5 Var
-        # Wir holen den echten Wert aus dem urspünglichen x_era5 Tensor zum Vergleich
-        orig_era5_sample = x_era5[0, 0, rand_y, rand_x]
-        assert torch.allclose(
-            ctx_era5_sample, orig_era5_sample
-        ), "ERA5 im Context ist falsch positioniert!"
+        if len(self.era5_vars) > 0:
+            ctx_era5_sample = x_context[
+                0, 1, rand_y, rand_x
+            ]  # Erster Context-Zeitschritt, erste ERA5 Var
+            # Wir holen den echten Wert aus dem urspünglichen x_era5 Tensor zum Vergleich
+            orig_era5_sample = x_era5[0, 0, rand_y, rand_x]
+            assert torch.allclose(
+                ctx_era5_sample, orig_era5_sample
+            ), "ERA5 im Context ist falsch positioniert!"
 
         # 2. Check: Static Alignment (z.B. DEM)
         # DEM ist die erste Variable in self.static_vars

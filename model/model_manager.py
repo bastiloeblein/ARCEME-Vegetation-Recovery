@@ -548,6 +548,9 @@ class ARCEMEPipeline:
 
         model.is_testing_mode = True
 
+        self.cfg["testing"]["save_tensors"] = True
+        self.cfg["testing"]["save_tensors"] = True
+
         v_cfg = self.cfg["data"]["variables"]
 
         # Define fixed patches for validation
