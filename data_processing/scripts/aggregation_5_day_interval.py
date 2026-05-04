@@ -36,15 +36,6 @@ def align_all_to_5d(ds, masking_type, show=True):
     # 2.1 Calculate the main statistics
     s2_res = s2_resampler.median()
 
-    # 2.2 Add additional statistics as new variables
-    # We use .count() which automatically excludes NaNs
-    s2_res_count = (
-        s2_resampler.count().rename({v: f"{v}_count" for v in s2_vars}).astype("uint8")
-    )
-    s2_res_min = s2_resampler.min().rename({v: f"{v}_min" for v in s2_vars})
-    s2_res_max = s2_resampler.max().rename({v: f"{v}_max" for v in s2_vars})
-    s2_res_std = s2_resampler.std().rename({v: f"{v}_std" for v in s2_vars})
-
     assess_data_availability(ds[s2_vars[0]], s2_res[s2_vars[0]], "s2")
 
     # 3. Resampling S1 data (radar):
@@ -58,36 +49,8 @@ def align_all_to_5d(ds, masking_type, show=True):
     s1_res = s1_resampler.median()
     s1_res = s1_res.rename({"time_sentinel_1_rtc": "time_sentinel_2_l2a"})
 
-    # 3.2 Add additional statistics as new variables
-    # We use .count() which automatically excludes NaNs
-    s1_res_count = (
-        s1_resampler.count()
-        .rename({v: f"{v}_count" for v in s1_vars})
-        .rename({"time_sentinel_1_rtc": "time_sentinel_2_l2a"})
-        .astype("uint8")
-    )
-    s1_res_min = (
-        s1_resampler.min()
-        .rename({v: f"{v}_min" for v in s1_vars})
-        .rename({"time_sentinel_1_rtc": "time_sentinel_2_l2a"})
-    )
-    s1_res_max = (
-        s1_resampler.max()
-        .rename({v: f"{v}_max" for v in s1_vars})
-        .rename({"time_sentinel_1_rtc": "time_sentinel_2_l2a"})
-    )
-    s1_res_std = (
-        s1_resampler.std()
-        .rename({v: f"{v}_std" for v in s1_vars})
-        .rename({"time_sentinel_1_rtc": "time_sentinel_2_l2a"})
-    )
-
-    # Merge S1 stats and THEN reindex to match S2 time exactly
-    s1_combined_stats = xr.merge(
-        [s1_res, s1_res_count, s1_res_min, s1_res_max, s1_res_std]
-    )
     # Optional: Think about it: This forces S1 to have the exact same time points as S2 (if there are S1 observations before or after S2 period, they get lost)
-    s1_aligned = s1_combined_stats.reindex(
+    s1_aligned = s1_res.reindex(
         time_sentinel_2_l2a=s2_res.time_sentinel_2_l2a, method=None
     )
 
@@ -110,10 +73,6 @@ def align_all_to_5d(ds, masking_type, show=True):
     combined = xr.merge(
         [
             s2_res,
-            s2_res_count,
-            s2_res_min,
-            s2_res_max,
-            s2_res_std,
             s1_aligned,
             static_features,
         ]
@@ -122,7 +81,9 @@ def align_all_to_5d(ds, masking_type, show=True):
     # Create mask for S2 and S1
     valid_binary = combined["kNDVI"].notnull()
     combined[f"s2_final_mask_{masking_type}"] = valid_binary.astype("uint8")
-    combined["s1_final_mask"] = combined["vh"].notnull().astype("uint8")
+    combined["s1_final_mask"] = (
+        combined["vv"].notnull() & combined["vh"].notnull()
+    ).astype("uint8")
 
     # Some assertions
     assert (

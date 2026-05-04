@@ -64,21 +64,28 @@ def normalize_era5_robust(ds, global_stats):
     """
     ds_norm = ds.copy()
 
-    for var in global_stats.keys():
-        if var in ds_norm.data_vars:
-            p_low = global_stats[var]["p0_01"]
-            p_high = global_stats[var]["p99_99"]
+    for ds_var in ds_norm.data_vars:
 
-            # Avoid division by zero in case p_low and p_high are the same
+        matched_stat_key = None
+        for stat_key in global_stats.keys():
+            if ds_var.startswith(stat_key):
+                matched_stat_key = stat_key
+                break
+
+        if matched_stat_key:
+            p_low = global_stats[matched_stat_key]["p0_01"]
+            p_high = global_stats[matched_stat_key]["p99_99"]
+
+            # Avoid division by zero
             denominator = p_high - p_low
             if denominator == 0:
                 denominator = 1e-8
 
             # 1. Standardize (v - p_low) / (p_high - p_low)
-            scaled_var = (ds_norm[var] - p_low) / denominator
+            scaled_var = (ds_norm[ds_var] - p_low) / denominator
 
             # 2. Clip to [-5, 5] to ensure network stability
-            ds_norm[var] = scaled_var.clip(min=-5.0, max=5.0).astype(np.float32)
+            ds_norm[ds_var] = scaled_var.clip(min=-5.0, max=5.0).astype(np.float32)
 
     return ds_norm
 

@@ -15,8 +15,8 @@ from data_processing.scripts.sentinel_1_processing import (
     find_global_veg_clipping_values,
     clip_s1_data,
     apply_lee_to_ds,
-    normalize_s1_vars,
-)  # , calculate_SAR_index #, aggregate_s1_causal_nearest
+    transform_and_normalize_s1_to_db,
+)
 from data_processing.scripts.sentinel_2_processing import (
     get_s2_quality_masks,
     get_vegetation_mask,
@@ -42,7 +42,8 @@ from data_processing.scripts.aggregation_5_day_interval import align_all_to_5d
 from data_processing.scripts.normalize_and_clip import (
     normalize_dem,
     calculate_global_era5_stats,
-    normalize_era5,
+    # normalize_era5,
+    normalize_era5_robust,
 )
 
 
@@ -107,22 +108,24 @@ def process_era5(cubes, era5_cubes, era5_dir):
 
     # Loop over all cubes (train + test)
     for key, ds_target in cubes.items():
-
-        cube_features = []
+        split = ds_target.attrs["split"]
+        split_dir = os.path.join(era5_dir, split)
+        os.makedirs(split_dir, exist_ok=True)
 
         # Caching check: if already exist load it
-        era5_path = os.path.join(era5_dir, f"{key}_era5.zarr")
+        era5_path = os.path.join(split_dir, f"{key}_era5.zarr")
         if os.path.exists(era5_path):
             print(f"-> Using cached ERA5 for {key}")
             era5_merged = xr.open_zarr(era5_path, consolidated=True)
         else:
+            print(f"#### Retrieving ERA5 data for cube {key} ###")
+            cube_features = []
             for i, era5_cube_raw in enumerate(era5_cubes):
-                print(f"#### Retrieving ERA5 data for cube {key} ###")
                 # 1. Temporal subset
                 tmp = subset_era5_time(era5_cube_raw, ds_target)
 
                 if tmp is None:
-                    print("❌ aggregate_era5_metrics_new hat None zurückgegeben!")
+                    print("❌ subset_era5_time hat None zurückgegeben!")
 
                 # 2. Spatial subset
                 tmp, _ = subset_era5_spatial(tmp, ds_target, plot_check=False)
@@ -156,41 +159,43 @@ def process_era5(cubes, era5_cubes, era5_dir):
         # Add to dict for global statistic
         all_era5_series[key] = era5_merged
 
-        if not all_era5_series:
-            raise ValueError(
-                "No ERA5 data was processed. Check input cubes and time ranges."
-            )
+    if not all_era5_series:
+        raise ValueError(
+            "No ERA5 data was processed. Check input cubes and time ranges."
+        )
 
     # --- GLOBAL STATISTIC CALCULATION ---
-    # CAREFUL: ONLY CALCULATE ON TRAIN (DATA LEAKAGE!)
-    train_keys = [k for k, ds in cubes.items() if ds.attrs.get("split") == "train"]
-    train_series = {k: all_era5_series[k] for k in train_keys}
+    if os.path.exists(stats_path):
+        print(f"Loading existing global stats from {stats_path}")
+        global_era5_stats = load_global_stats(stats_path)
+    else:
+        # CAREFUL: ONLY CALCULATE ON TRAIN (DATA LEAKAGE!)
+        train_keys = [k for k, ds in cubes.items() if ds.attrs.get("split") == "train"]
+        train_series = {k: all_era5_series[k] for k in train_keys}
 
-    print(
-        f"Calculating global ERA5 stats based on {len(train_series)} training cubes..."
-    )
+        print(
+            f"Calculating global ERA5 stats based on {len(train_series)} training cubes..."
+        )
 
-    first_key = list(all_era5_series.keys())[0]
-    era5_stats_vars = list(all_era5_series[first_key].data_vars)
+        first_key = list(all_era5_series.keys())[0]
+        era5_stats_vars = list(all_era5_series[first_key].data_vars)
 
-    # ONLY CALCULATE GLOBAL STATS BASED ON TRAIN KEYS!
-    global_era5_stats = calculate_global_era5_stats(train_series, era5_stats_vars)
+        # ONLY CALCULATE GLOBAL STATS BASED ON TRAIN KEYS!
+        global_era5_stats = calculate_global_era5_stats(train_series, era5_stats_vars)
 
-    # Save stats
-    save_stats_to_json(global_era5_stats, stats_path)
+        # Save stats
+        save_stats_to_json(global_era5_stats, stats_path)
 
-    print("✅ Global ERA5 stats calculated and ERA5 cubes saved.")
+        print("✅ Global ERA5 stats calculated and ERA5 cubes saved.")
 
-    # Cleanup
-    del all_era5_series
+        # Cleanup
+        del all_era5_series
     gc.collect()
 
     return global_era5_stats
 
 
-# --- 2. DIE HAUPTSCHLEIFE ---
-
-
+# --- 2. MAIN LOOP FOR CUBE PROCESSING ---
 def run_processing_pipeline(
     cubes, era5_cubes, train_dir, test_dir, era5_dir, info_base, global_s1, global_era5
 ):
@@ -201,7 +206,7 @@ def run_processing_pipeline(
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
 
-    vv_max, vh_max = global_s1
+    global_vv_max, global_vh_max = global_s1
 
     cube_keys = list(cubes.keys())
     for n, key in enumerate(cube_keys):
@@ -238,12 +243,12 @@ def run_processing_pipeline(
             ds = get_s2_quality_masks(ds)
             ds = get_vegetation_mask(ds)
             ds = apply_masking(ds)
-            report_permanent_nans_for_var(ds, "B01", "time_sentinel_2_l2a")
+            report_permanent_nans_for_var(ds, "B04", "time_sentinel_2_l2a")
 
             # --- STAGE 2: BAND NORMALIZATION ---
             print("Step 2: Cleaning and Normalizing Spectral Bands...")
             ds = clean_and_normalize_bands(ds)
-            report_permanent_nans_for_var(ds, "B01_normalized", "time_sentinel_2_l2a")
+            report_permanent_nans_for_var(ds, "B04", "time_sentinel_2_l2a")
 
             ## --- STAGE 3: INDEX CALCULATION ---
             print("Step 3: Calculating Vegetation and Water Indices...")
@@ -263,10 +268,10 @@ def run_processing_pipeline(
             # --- STAGE 5: DATASET CLEANUP & INTEGRATION ---
             print("Step 5: Final Mask Integration and Dropping Raw Bands...")
             ds = integrate_veg_and_wrongly_classified_mask(ds)
-            all_b_bands = [
-                v for v in ds.data_vars if v.startswith("B") and v[1].isalnum()
-            ]
-            ds = ds.drop_vars(all_b_bands)
+            # all_b_bands = [
+            #     v for v in ds.data_vars if v.startswith("B") and v[1].isalnum()
+            # ]
+            # ds = ds.drop_vars(all_b_bands)
 
             # --- STAGE 6: SENTINEL-1 (SAR) PROCESSING ---
             print("Step 6: Processing Sentinel-1 (Radar) Data...")
@@ -282,7 +287,7 @@ def run_processing_pipeline(
             # Process S1 vars
             ds = clip_s1_data(ds, global_vv_max, global_vh_max)
             ds = apply_lee_to_ds(ds, bands=["vv", "vh"], win_size=7, cu=0.25)
-            ds = normalize_s1_vars(ds, global_vv_max, global_vh_max)
+            ds = transform_and_normalize_s1_to_db(ds, bands=["vv", "vh"])
 
             # Integrity check for NaNs
             nan_mask_vv_after = ds.vv.isnull()
@@ -304,7 +309,8 @@ def run_processing_pipeline(
 
             # --- STAGE 8: ERA5 CLIMATE DATA MERGING ---
             print("Step 8: Merging and Standardizing ERA5 Climate Data...")
-            era5_path = os.path.join(era5_dir, f"{cube_id}_era5.zarr")
+            split = ds.attrs["split"]
+            era5_path = os.path.join(era5_dir, split, f"{cube_id}_era5.zarr")
 
             if os.path.exists(era5_path):
                 # 1. Load daily data
@@ -322,7 +328,9 @@ def run_processing_pipeline(
                 )
 
                 # Normalize ERA5
-                era5_resampled = normalize_era5(era5_resampled, global_era5_stats)
+                era5_resampled = normalize_era5_robust(
+                    era5_resampled, global_era5_stats
+                )
 
                 # Delete encodings to avoid conflicts
                 for v in era5_resampled.data_vars:
@@ -522,7 +530,7 @@ if __name__ == "__main__":
     ERA5_PATH = os.getenv("ERA5_DATA_PATH")
     BUCKET_NAME = os.getenv("BUCKET_NAME")
     BASE_OUTPUT_DIR = os.getenv("OUTPUT_DIR")
-    S3_ENDPOINT = os.getenv("S3_ENDPOINT")  #
+    S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 
     # Subfolder for train, test and era5
     TRAIN_OUTPUT = os.path.join(BASE_OUTPUT_DIR, "train")
@@ -530,7 +538,7 @@ if __name__ == "__main__":
     ERA5_DIR = os.path.join(BASE_OUTPUT_DIR, "era5")
 
     INFO_DIR = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "reports/final_cube_info"
+        os.path.dirname(os.path.abspath(__file__)), "..", "reports/final_cube_info_new"
     )
 
     pei_cube_name = "PEICube_era5land.zarr"
@@ -556,7 +564,7 @@ if __name__ == "__main__":
         f"Fetching {len(all_cube_ids)} cubes (Train: {len(train_ids)}, Test: {len(test_ids)})..."
     )
     cubes = {}
-    for cube_id in all_cube_ids:
+    for cube_id in all_cube_ids:  # test_ids or all_cube_ids
         try:
             url = f"{S3_BASE_URL}{BUCKET_NAME}/DC__{cube_id}.zarr"
             mapper = fsspec.get_mapper(url)
@@ -616,14 +624,7 @@ if __name__ == "__main__":
         for name in [pei_cube_name, t2_cube_name, tp_cube_name]
     ]
 
-    if os.path.exists(era5_stats_path):
-        print(f"-> Loading existing ERA5 global stats from {era5_stats_path}")
-        global_era5_stats = load_global_stats(era5_stats_path)
-        # Ensuring that an era5 cube will be created for each cube
-        _ = process_era5(cubes, era5_cubes, ERA5_DIR)
-    else:
-        print("-> ERA5 stats not found. Starting Phase 1 (Global Extraction)...")
-        global_era5_stats = process_era5(train_cubes_dict, era5_cubes, ERA5_DIR)
+    global_era5_stats = process_era5(cubes, era5_cubes, ERA5_DIR)
 
     # 6. RUN THE PIPELINE
     if cubes:

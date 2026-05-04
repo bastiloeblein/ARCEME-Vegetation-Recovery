@@ -107,12 +107,12 @@ if __name__ == "__main__":
     # 1. Define data directories
     S3_BASE_URL = os.getenv("S3_BASE_URL")
     BUCKET_NAME = os.getenv("BUCKET_NAME")
-    SPLIT = "train"
+    SPLIT = "train"  # test
     CUBE_DIR = os.path.join(os.getenv("OUTPUT_DIR"), SPLIT)
     S3_ENDPOINT = os.getenv("S3_ENDPOINT")
     OUTPUT_DIR = os.path.join(CUBE_DIR, "postprocessed")
     INFO_DIR = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "reports/final_cube_info"
+        os.path.dirname(os.path.abspath(__file__)), "..", "reports/final_cube_info_new"
     )
 
     # Create dir if doesnt exist yet
@@ -199,6 +199,9 @@ if __name__ == "__main__":
                 save_plot_to_report(fig, report_sequence, stdout_buffer)
             else:
                 print("❌ No cloud-free indices available to plot RGB.")
+
+            ds_plot.close()
+            del ds_plot
 
             # 2. S2 Variable Plot
             print("Visual analysis of S2 Variables")
@@ -469,13 +472,14 @@ if __name__ == "__main__":
                     save_plot_to_report(fig, report_sequence, stdout_buffer)
 
             # ----- EXPORT ----
+            # Remove intermediate mask variables from dataset if they exist
+            ds_final = ds_final.drop_vars(
+                ["s1_final_mask", "s2_final_mask"], errors="ignore"
+            )
             # Assure variable dtypes
             uint8_vars = ["ESA_LC", "is_veg", "mask_s1", "mask_s2", "target_mask"]
             for var in list(ds_final.data_vars):
                 ds_final[var].encoding = {}  # remove old encodings
-                if var in ["s1_final_mask", "s2_final_mask"]:
-                    ds_final = ds_final.drop_vars(var)
-                    continue
                 if var in uint8_vars or var.endswith("_count"):
                     ds_final[var] = ds_final[var].astype("uint8")
                 else:
@@ -518,6 +522,11 @@ if __name__ == "__main__":
                 save_path, mode="w", consolidated=True, encoding=final_encoding
             )
             print(f"✅ SUCCESS: Postprocessed cube saved to {save_path}")
+
+            # --- CRITICAL: CLOSE ALL DATASETS BEFORE DELETING SOURCE ---
+            ds_final.close()
+            ds_intp.close()
+            ds.close()
 
             # --- DELETE SOURCE CUBE ---
             source_cube_path = os.path.join(CUBE_DIR, cube_name)
