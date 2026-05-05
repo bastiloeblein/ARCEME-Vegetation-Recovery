@@ -546,8 +546,16 @@ def plot_variable_analysis(
 def plot_variable_stats(ds, var_name, num_samples=5000):
     """Plots mean, min and max of variable on subsample."""
 
-    # 1. Get vegetation mask
-    veg_mask = ds["is_veg"] == 1
+    # 1. Get vegetation mask and force it to be 2D
+    veg_da = ds["is_veg"]
+
+    if "time_sentinel_2_l2a" in veg_da.dims:
+        veg_da = veg_da.isel(time_sentinel_2_l2a=0)
+
+    veg_mask = veg_da.squeeze() == 1
+
+    # # 1. Get vegetation mask
+    # veg_mask = ds["is_veg"] == 1
 
     # 2. Define vegetation coords
     y_coords, x_coords = np.where(veg_mask.values)

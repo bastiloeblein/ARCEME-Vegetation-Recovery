@@ -110,7 +110,9 @@ if __name__ == "__main__":
     SPLIT = "train"  # test
     CUBE_DIR = os.path.join(os.getenv("OUTPUT_DIR"), SPLIT)
     S3_ENDPOINT = os.getenv("S3_ENDPOINT")
-    OUTPUT_DIR = os.path.join(CUBE_DIR, "postprocessed")
+
+    BASE_FINAL_DIR = "/net/projects/arceme/vegetation_recovery_prediction/data/final"
+    OUTPUT_DIR = os.path.join(BASE_FINAL_DIR, SPLIT)
     INFO_DIR = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "..", "reports/final_cube_info_new"
     )
@@ -141,7 +143,19 @@ if __name__ == "__main__":
     }
 
     # Define vars of interest
-    S2_VARS = ["NDVI", "kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]
+    S2_VARS = [
+        "NDVI",
+        "kNDVI",
+        "CIRE",
+        "IRECI",
+        "NDWI",
+        "NDMI",
+        "NIRv",
+        "B04",
+        "B03",
+        "B02",
+        "B08",
+    ]
     S1_VARS = ["vv", "vh"]
     STATIC_VARS = ["ESA_LC", "COP_DEM", "is_veg"]
     ERA5_VARS = [
@@ -165,6 +179,18 @@ if __name__ == "__main__":
     cube_list = [file for file in cube_list if file[0] == "2"]
 
     for n, cube_name in enumerate(cube_list):
+
+        # 1. Extract cube_id and define save path for postprocessed cube
+        expected_cube_id = cube_name.replace(".zarr", "")
+        save_path = os.path.join(OUTPUT_DIR, f"{expected_cube_id}_postprocessed.zarr")
+
+        # 2. SKIP LOGIC
+        if os.path.exists(save_path):
+            print(
+                f"⏭️ Skipping {expected_cube_id} ({n+1}/{len(cube_list)}): Already exists in final dir."
+            )
+            continue
+
         # --- SETUP REPORTING ---
         stdout_buffer = io.StringIO()
         sys.stdout = stdout_buffer
@@ -199,9 +225,6 @@ if __name__ == "__main__":
                 save_plot_to_report(fig, report_sequence, stdout_buffer)
             else:
                 print("❌ No cloud-free indices available to plot RGB.")
-
-            ds_plot.close()
-            del ds_plot
 
             # 2. S2 Variable Plot
             print("Visual analysis of S2 Variables")
@@ -311,6 +334,9 @@ if __name__ == "__main__":
             axes[2].axis("off")
             plt.tight_layout()
             save_plot_to_report(fig_comp, report_sequence, stdout_buffer)
+
+            ds_plot.close()
+            del ds_plot
 
             # 6. Spatial NAN Analysis
             print("Spatial NaN analysis")
@@ -529,19 +555,19 @@ if __name__ == "__main__":
             ds.close()
 
             # --- DELETE SOURCE CUBE ---
-            source_cube_path = os.path.join(CUBE_DIR, cube_name)
-            try:
-                import shutil
+            # source_cube_path = os.path.join(CUBE_DIR, cube_name)
+            # try:
+            #     import shutil
 
-                if os.path.exists(save_path):
-                    shutil.rmtree(source_cube_path)
-                    print(f"🗑️ DELETED source cube to free space: {source_cube_path}")
-                else:
-                    print(
-                        f"⚠️ Warning: Save path {save_path} not found. Source NOT deleted."
-                    )
-            except Exception as e_del:
-                print(f"❌ Failed to delete source cube {source_cube_path}: {e_del}")
+            #     if os.path.exists(save_path):
+            #         shutil.rmtree(source_cube_path)
+            #         print(f"🗑️ DELETED source cube to free space: {source_cube_path}")
+            #     else:
+            #         print(
+            #             f"⚠️ Warning: Save path {save_path} not found. Source NOT deleted."
+            #         )
+            # except Exception as e_del:
+            #     print(f"❌ Failed to delete source cube {source_cube_path}: {e_del}")
 
         except Exception as e:
             print(f"\nERROR: {str(e)}")

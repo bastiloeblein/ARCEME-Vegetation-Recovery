@@ -360,6 +360,9 @@ def run_processing_pipeline(
             # --- STAGE 10: EXPORT ---
             print("Step 10: Final Export Preparation")
 
+            print("Computing full cube in memory to avoid Dask chunking crashes...")
+            ds = ds.compute()
+
             compressor = zarr.Blosc(
                 cname="zstd", clevel=3, shuffle=zarr.Blosc.BITSHUFFLE
             )
