@@ -31,6 +31,13 @@ def main():
         help="Whether to resume from 'last.ckpt' or the 'best' checkpoint.",
     )
 
+    parser.add_argument(
+        "--ablation_split_path",
+        type=str,
+        default=None,
+        help="Path to an old cv_splits.json. Uses exact same folds but starts a fresh training run.",
+    )
+
     args = parser.parse_args()
 
     # Load Config
@@ -38,7 +45,12 @@ def main():
         cfg = yaml.safe_load(f)
 
     # Initialize Pipeline
-    pipeline = ARCEMEPipeline(config=cfg, mode="train", run_dir=args.resume_run)
+    pipeline = ARCEMEPipeline(
+        config=cfg,
+        mode="train",
+        run_dir=args.resume_run,
+        ablation_split_path=args.ablation_split_path,
+    )
 
     # Start Training
     pipeline.run_cv(start_fold=args.resume_fold, resume_from_type=args.resume_type)
@@ -55,4 +67,6 @@ if __name__ == "__main__":
 # Start model from zero: (not passing --resume_run or --resume_fold)
 #       - CUDA_VISIBLE_DEVICES=X  python train.py
 # Start model after it crashed in fold X: either use last or best checkpoint (depending on what you want)
-#       - CUDA_VISIBLE_DEVICES=X  python train.py --resume_run path/to/run_dir --resume_fold X --resume-type last
+#       - CUDA_VISIBLE_DEVICES=X  python train.py --resume_run path/to/run_dir --resume_fold X --resume_type last
+# Start ABLATION STUDY (Fresh run, but with exact same folds as an old run):
+#       - CUDA_VISIBLE_DEVICES=X python train.py --ablation_split_path /pfad/zur/alten/cv_splits.json

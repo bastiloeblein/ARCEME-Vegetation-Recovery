@@ -37,7 +37,7 @@ def seed_worker(worker_id):
 
 
 class ARCEMEPipeline:
-    def __init__(self, config, mode="train", run_dir=None):
+    def __init__(self, config, mode="train", run_dir=None, ablation_split_path=None):
         self.mode = mode  # "train" or "eval"
         self.cfg = config
         self.v_cfg = self.cfg["data"]["variables"]
@@ -83,6 +83,28 @@ class ARCEMEPipeline:
             os.makedirs(self.run_dir, exist_ok=True)
             print(f"📁 Created new Run Directory: {self.run_dir}")
 
+            # =================================================================
+            # Ablation Split Import (Import predefined cv_splits)
+            # =================================================================
+            if ablation_split_path is not None:
+                if os.path.exists(ablation_split_path):
+                    import shutil
+
+                    # Copies existing cv_split into run_dir
+                    target_split_path = os.path.join(self.run_dir, "cv_splits.json")
+                    shutil.copy2(ablation_split_path, target_split_path)
+
+                    print(
+                        f"🧬 ABLATION STUDY: Predefined splits from {ablation_split_path} imported!"
+                    )
+
+                else:
+                    raise FileNotFoundError(
+                        f"❌ ERROR: Path does not exist!\n"
+                        f"Passed: {ablation_split_path}\n"
+                        f"Check path in terminal!"
+                    )
+            # =================================================================
             # Save config for this run
             with open(os.path.join(self.run_dir, "config_used.yaml"), "w") as f:
                 yaml.dump(self.cfg, f)
@@ -181,9 +203,6 @@ class ARCEMEPipeline:
         # Create Splits based on defined strategy
         if self.cv_type == "llto":
             print("\n✂️ Creating LLTO Cross-Validation Splits...")
-            # cv_data = get_llto_splits(
-            #     valid_zarrs_paths, self.train_test_split_csv,  k=self.k_folds, show=True
-            # )
             cv_data = create_spacetime_folds(
                 valid_zarrs_paths,
                 self.train_test_split_csv,
@@ -196,9 +215,6 @@ class ARCEMEPipeline:
             )
         elif self.cv_type == "llto_strict":
             print("\n✂️ Creating LLTO-Strict Cross-Validation Splits...")
-            # cv_data = get_llto_splits_strict(
-            #     valid_zarrs_paths, self.train_test_split_csv,  k=self.k_folds, show=True, strict=True
-            # )
             cv_data = create_spacetime_folds(
                 valid_zarrs_paths,
                 self.train_test_split_csv,
@@ -422,13 +438,16 @@ class ARCEMEPipeline:
 
             # maybe delete this and fix by saving the excluded cubes in the run_dir
             if fold_idx == start_fold and not resume_ckpt:
-                # Log artifact only on first fresh fold
-                exclusion_artifact = wandb.Artifact(
-                    name=f"exclusion_list_{self.cfg['experiment_name']}",
-                    type="dataset_metadata",
-                )
-                exclusion_artifact.add_file(self.exclude_csv_path)
-                wandb_logger.experiment.log_artifact(exclusion_artifact)
+                if os.path.exists(self.exclude_csv_path):
+                    # Log artifact only on first fresh fold
+                    exclusion_artifact = wandb.Artifact(
+                        name=f"exclusion_list_{self.cfg['experiment_name']}",
+                        type="dataset_metadata",
+                    )
+                    exclusion_artifact.add_file(self.exclude_csv_path)
+                    wandb_logger.experiment.log_artifact(exclusion_artifact)
+                else:
+                    print(f"⚠️ Warning: {self.exclude_csv_path} not  found gefunden.")
 
             # --- Callbacks ---
             ckpt_dir = os.path.join(self.run_dir, f"fold_{fold_idx}", "checkpoints")

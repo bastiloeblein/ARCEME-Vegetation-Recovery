@@ -428,6 +428,9 @@ class ConvLSTM_Model(pl.LightningModule):
             if is_testing:
                 # 1. EVALUATION: Plot all
                 should_plot = True
+                plot_path = os.path.join(
+                    self.cfg["model"]["run_dir"], "plots", "evaluation_samples"
+                )
             elif self.current_epoch == 0:
                 # 3.1 Save quality ratio for all cubes in epoch 0
                 if not hasattr(self, "cube_scouting_scores"):
@@ -449,11 +452,30 @@ class ConvLSTM_Model(pl.LightningModule):
 
                 # 4.1 Get vegetation mask for the cube
                 # Get path
-                cube_path = os.path.join(
-                    self.cfg["data"]["test_data_dir"], f"{cube_id}.zarr"
-                )
+                if is_testing:
+                    base_dir = self.cfg["data"]["test_data_dir"]
+                else:
+                    base_dir = self.cfg["data"]["train_data_dir"]
 
-                # 2. Cube kurz öffnen und nur is_veg als 1000x1000 Array laden
+                cube_path = os.path.join(base_dir, f"{cube_id}_postprocessed.zarr")
+
+                # ONLY FOR ABLATION STUDY - DELETE LATER!
+                # train_dir = self.cfg["data"]["train_data_dir"]
+                # test_dir = "/net/projects/arceme/vegetation_recovery_prediction/data/final/test"
+                # cube_filename = f"{cube_id}_postprocessed.zarr"
+
+                # # 1. Zuerst im Train-Ordner suchen
+                # cube_path = os.path.join(train_dir, cube_filename)
+
+                # # 2. Falls nicht in Train, dann im Test-Ordner suchen
+                # if not os.path.exists(cube_path):
+                #     cube_path = os.path.join(test_dir, cube_filename)
+
+                #     # Optional: Ein kleiner Sicherheits-Check, falls die Datei GANZ fehlt
+                #     if not os.path.exists(cube_path):
+                #         raise FileNotFoundError(f"❌ Cube {cube_filename} weder in Train noch in Test gefunden!")
+
+                # 2. Open cube and load is_veg
                 ds_cube = xr.open_zarr(cube_path)
                 is_veg_cube = (
                     ds_cube["is_veg"].isel(time_sentinel_2_l2a=0).values
@@ -468,7 +490,11 @@ class ConvLSTM_Model(pl.LightningModule):
                     is_veg_cube=is_veg_cube,
                     cube_id=cube_id,
                     epoch=self.current_epoch,
-                    save_path=os.path.join(self.cfg["model"]["run_dir"], "plots"),
+                    save_path=(
+                        plot_path
+                        if is_testing
+                        else os.path.join(self.cfg["model"]["run_dir"], "plots")
+                    ),
                     logger=self.logger,
                 )
 
@@ -691,8 +717,14 @@ class ConvLSTM_Model(pl.LightningModule):
             metrics_to_log["val/grand_mean_macro/MAE"] = (
                 sum(c["mae"] for c in all_cube_metrics) / n_c
             )
+            metrics_to_log["val/grand_mean_macro/MAE_base"] = (
+                sum(c["mae_base"] for c in all_cube_metrics) / n_c
+            )
             metrics_to_log["val/grand_mean_macro/Bias"] = (
                 sum(c["bias"] for c in all_cube_metrics) / n_c
+            )
+            metrics_to_log["val/grand_mean_macro/Bias_base"] = (
+                sum(c["bias_base"] for c in all_cube_metrics) / n_c
             )
             metrics_to_log["val/grand_mean_macro/R2"] = (
                 sum(c["r2"] for c in all_cube_metrics) / n_c
@@ -837,35 +869,6 @@ class ConvLSTM_Model(pl.LightningModule):
             threshold=self.cfg["training"]["optimizer"]["lr_threshold"],
         )
 
-        # # Get warmup parameters from config
-        # warmup_cfg = self.cfg["training"]["optimizer"].get("warmup", {})
-        # if warmup_cfg.get("enabled", False):
-        #     warmup_epochs = warmup_cfg.get("epochs", 3)
-        #     # Warmup scheduler: for first epochs climbs from 0.01 to 100% of the target LR
-        #     warmup_scheduler = LinearLR(
-        #         optimizer,
-        #         start_factor=0.01,  # Startet bei 1% der Ziel-LR
-        #         end_factor=1.0,
-        #         total_iters=warmup_epochs,
-        #     )
-
-        #     # Combine warmup and plateau schedulers sequentially
-        #     # combined_scheduler = torch.optim.lr_scheduler.SequentialLR(
-        #     #     optimizer,
-        #     #     schedulers=[warmup_scheduler, plateau_scheduler],
-        #     #     milestones=[warmup_epochs]
-        #     # )
-
-        #     return {
-        #         "optimizer": optimizer,
-        #         "lr_scheduler": {
-        #             "scheduler": torch.optim.lr_scheduler.ChainedScheduler([warmup_scheduler, plateau_scheduler]),
-        #             "monitor": monitor_key,
-        #             "interval": "epoch",
-        #             "frequency": 1,
-        #         },
-        #     }
-
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -884,7 +887,6 @@ class ConvLSTM_Model(pl.LightningModule):
 
             def get_activation(name):
                 def hook(model, input, output):
-                    # output bei ConvLSTM ist oft (hidden_state, cell_state)
                     if isinstance(output, tuple):
                         activations[name] = output[0].detach()
                     else:
@@ -892,7 +894,7 @@ class ConvLSTM_Model(pl.LightningModule):
 
                 return hook
 
-            # Dynamische Layer-Auswahl
+            # Dynamic Layer Selection
             if (
                 hasattr(self.model, "encoder_cells")
                 and len(self.model.encoder_cells) > 0
@@ -901,7 +903,6 @@ class ConvLSTM_Model(pl.LightningModule):
             elif hasattr(self.model, "cell_list") and len(self.model.cell_list) > 0:
                 target_layer = self.model.cell_list[-2]
             else:
-                # Fallback auf das Modell selbst, falls keine Liste gefunden wird
                 target_layer = self.model
 
             handle = target_layer.register_forward_hook(get_activation("last_hidden"))
@@ -923,20 +924,16 @@ class ConvLSTM_Model(pl.LightningModule):
             fig, axes = plt.subplots(2, 4, figsize=(15, 8))
             axes_flat = axes.flatten()
 
-            # num_layers_available = hidden.shape[1] if torch.is_tensor(hidden) else len(hidden)
-
-            # Visualisierung der ersten 8 Hidden Channels des ersten Batch-Samples
+            # Visualize first 8 Hidden channels in first batch samples
             for i in range(8):
                 ax = axes_flat[i]
 
-                # Nur plotten, wenn der Channel existiert
                 if i < num_to_plot:
                     h_img = hidden[0, i].cpu().numpy()
                     im = ax.imshow(h_img, cmap="viridis")
                     ax.set_title(f"Channel {i}\nMax: {h_img.max():.4f}")
                     plt.colorbar(im, ax=ax)
                 else:
-                    # Deaktiviere Achsen für leere Plots (verhindert den Fehler)
                     ax.axis("off")
                     ax.set_title("N/A")
 
@@ -953,7 +950,6 @@ class ConvLSTM_Model(pl.LightningModule):
         if self.logger is not None:
             x_ctx, x_fut, y_true, mask, meta, baseline_sample = batch
 
-            # Deine Funktion von oben aufrufen
             fig = self.visualize_hidden_states(x_ctx, x_fut, baseline_sample)
 
             if isinstance(self.logger, WandbLogger):
@@ -974,48 +970,30 @@ class ConvLSTM_Model(pl.LightningModule):
 
     def on_after_backward(self):
         if self.logger is not None:
-            # Diese Methode wird nach jedem Gradienten-Schritt aufgerufen
-            if (
-                self.global_step % 50 == 0
-            ):  # Alle 10 Schritte loggen, um TB nicht zu fluten
-                # In deiner on_after_backward Methode:
+            if self.global_step % 50 == 0:
                 mask_sum = getattr(self, "last_mask_sum", 1.0)
                 grad_dict = {}
                 for name, param in self.named_parameters():
                     if param.grad is not None:
                         # Nur den Mittelwert der absoluten Gradienten loggen
+                        # Log mean of absolut gradient
                         raw_grad_mean = param.grad.abs().mean().item()
-                        # Grad_norm: Es ist die absolute Summe (oder der Durchschnitt) der Gradienten, die an einem Parameter ankommen. Da dein Bias-Parameter im predict_layer auf jeden validen Pixel im Batch wirkt, "hört" er die Schreie von 90.000+ Pixeln gleichzeitig. Er summiert diese Signale auf. Deshalb siehst du 90.000, obwohl jeder Pixel nur mit der Stärke "1" drückt.
-                        # grad_dict[f"grad_norms/{name}"] = raw_grad_mean
-                        # Grad per pixel: Normiert den wert und checkt: what is average gradient signal per pixel?
                         grad_dict[f"grad_per_pixel/{name}"] = raw_grad_mean / (
                             mask_sum + 1e-8
                         )
                 self.logger.experiment.log(grad_dict, commit=False)
 
-    # def on_before_optimizer_step(self, optimizer):
-
-    #     if self.logger is not None:
-    #         if self.global_step % 50 == 0:
-    #             grad_dict = {}
-    #             for name, param in self.named_parameters():
-    #                 if param.grad is not None:
-    #                     grad_dict[f"grad_clipped/{name}"] = (
-    #                         param.grad.abs().mean().item()
-    #                     )
-    #             self.logger.experiment.log(grad_dict, commit=False)
-
-    # In deinem TrainingStep oder am Ende der Epoche:
     def on_train_epoch_end(self):
-        # 1. Den Bias-Wert selbst loggen (Nicht den Gradienten!)
-        # Das zeigt dir, ob der Bias irgendwo bei -50 landet oder gesund bei 0.01 bleibt
         self.log("weights/predict_layer_bias", self.model.predict_layer.bias.item())
+        if self.cfg["model"]["model_type"] == "SGConvLSTM":
+            for i, cell in enumerate(self.model.cell_list):
+                self.log(f"weights/std_cell_{i}", cell.conv.weight.std().item())
 
-        # 2. Die Standardabweichung der Gewichte im LSTM
-        # Wenn die Std gegen 0 geht, "stirbt" dein Layer (alle Neuronen machen das Gleiche)
-        for i, cell in enumerate(self.model.cell_list):
-            self.log(f"weights/std_cell_{i}", cell.conv.weight.std().item())
+        elif self.cfg["model"]["model_type"] == "SGEDConvLSTM":
+            for i, cell in enumerate(self.model.encoder_cells):
+                self.log(f"weights/std_encoder_cell_{i}", cell.conv.weight.std().item())
+            for i, cell in enumerate(self.model.decoder_cells):
+                self.log(f"weights/std_decoder_cell_{i}", cell.conv.weight.std().item())
 
-        # 3. Aktuelle Learning Rate (Um den Warmup zu verifizieren)
         current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
         self.log("lr/current", current_lr)

@@ -1,8 +1,8 @@
-experiment_name: "New_SGConvLSTM_small_test"
+experiment_name: "Final_Model_SGConvLSTM_Indices_llto_strict"
 data:
-  train_data_dir: "/scratch/sloeblein/postprocessed" #/net/projects/arceme/vegetation_recovery_prediction/postprocessed"
+  train_data_dir: "/net/projects/arceme/vegetation_recovery_prediction/data/final/train" #"/scratch/sloeblein/postprocessed" #/net/projects/arceme/vegetation_recovery_prediction/postprocessed"
   train_test_split: "data_processing/data/train_test_split.csv"
-  test_data_dir: None # path to test data
+  test_data_dir: "/net/projects/arceme/vegetation_recovery_prediction/data/final/test" # path to test data
   quality_check:
     # Context History
     ctx_min_valid_ratio: 0.05    # At least X% of all pixels need to be valid
@@ -18,9 +18,13 @@ data:
   variables:
     s2:
       - "kNDVI"
+      # - "B02"
+      # - "B03"
+      # - "B04"
+      # - "B8A"
       - "IRECI"
       - "NDMI"
-      - "NIRv" # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
+      - "NIRv"  # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
     s1:
       - "vv"
       - "vh"
@@ -38,23 +42,23 @@ data:
     static:
       - "COP_DEM" # Static vars (ESA_LC not included because one hot encoding is done in dataloader)
   data_loader:
-    num_workers: 4
+    num_workers: 12
 training:
   seed: 42
   optimizer:
     name: "adamW"
-    start_learn_rate: 0.0003
+    start_learn_rate: 0.0001
     warmup:
-      enabled: false
+      enabled: true
       epochs: 5
-    lr_factor: 0.1
+    lr_factor: 0.25
     lr_threshold: 0.0001
     patience: 20
   gradient_clipping:
-    enabled: true
-    value: 2.0
+    enabled: false
+    value: 1.0
     algorithm: "norm"
-  batch_size: 4
+  batch_size: 8
   accumulate_grad_batches: 1
   max_epochs: 200
   accelerator: "gpu"
@@ -71,7 +75,7 @@ training:
     selection_metric: "mse"
     monitor:
       # split: "val"
-      metric: "val/grand_mean_micro/NNSE" # "gm_nnse"
+      metric: "val/grand_mean_macro/NNSE" # "gm_nnse"
     monitor_mode: "max" #"max"  # "max" for nnse, "min" for loss
     min_pixel_threshold: 0.15 #  Minimum pixel threshold, so a cube is consider for validation metric calculation
     log_timestep_metrics: False # Whether to log timestep-wise metrics across all cubes during validation/testing
@@ -80,9 +84,9 @@ model:
   checkpoint_path: None
   output_channels: 1      # We want to predict 1 channel (kNDVI)
   hidden_channels:
-  - 64
-  - 64
-  - 64
+  - 96 #96  # 64
+  - 96 # 96 # 64
+  - 96 # 96 # 64
   n_layers: 3 #3 #4
   kernel: 5
   dilation_rate: 1
@@ -92,7 +96,7 @@ model:
 cross_validation:
   enabled: True
   k_folds: 3
-  type: "llto" # llto_strict
+  type: "llto_strict" # llto_strict
 testing:
   save_tensors: False # Whether to save prediction and target tensors during testing for detailed analysis
   save_metrics: False # Whether to save computed metrics during testing for detailed analysis

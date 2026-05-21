@@ -431,9 +431,7 @@ class ARCEME_Dataset(Dataset):
         x_s2_mask = torch.from_numpy(ds_ctx[s2_vars_mask].to_array().values).float()
 
         # Dynamic S2 mask: 1 if ALL channels are valid (non-NAN) else 0, multiplied by vegetation mask
-        m_s2 = (~torch.isnan(x_s2_mask)).all(dim=0, keepdim=True).float().unsqueeze(
-            0
-        ) * is_veg
+        m_s2 = (~torch.isnan(x_s2_mask)).all(dim=0, keepdim=True).float() * is_veg
 
         # Replace NaNs in x_s2 with 0.0 (after creating the mask to avoid losing information about valid pixels)
         x_s2 = torch.nan_to_num(x_s2, nan=0.0)

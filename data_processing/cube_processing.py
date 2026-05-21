@@ -361,7 +361,6 @@ def run_processing_pipeline(
             print("Step 10: Final Export Preparation")
 
             print("Computing full cube in memory to avoid Dask chunking crashes...")
-            ds = ds.compute()
 
             compressor = zarr.Blosc(
                 cname="zstd", clevel=3, shuffle=zarr.Blosc.BITSHUFFLE
@@ -527,6 +526,29 @@ def load_s1_stats(file_path):
 if __name__ == "__main__":
 
     load_dotenv(find_dotenv())
+
+    # ====================================================================
+    # DASK CLUSTER SETUP
+    # ====================================================================
+    from dask.distributed import Client, LocalCluster
+    import dask
+
+    # 1. Set strict OOM-Rules (to avoid corrupted data)
+    dask.config.set({"distributed.worker.memory.target": 0.70})
+    dask.config.set({"distributed.worker.memory.spill": 0.85})
+    dask.config.set({"distributed.worker.memory.terminate": 0.95})
+
+    # 2. Start Cluster
+    cluster = LocalCluster(
+        n_workers=4,  # 4 python processes
+        threads_per_worker=2,  # Each worker gets 2 threads
+        memory_limit="20GB",  # each worker 20 GB
+        dashboard_address=None,
+    )
+    client = Client(cluster)
+    print("\n✅ DASK CLUSTER ONLINE!")
+    print(f"🔗 Connected with: {client}")
+    # ====================================================================
 
     # 1. Define data directories
     S3_BASE_URL = os.getenv("S3_BASE_URL")
