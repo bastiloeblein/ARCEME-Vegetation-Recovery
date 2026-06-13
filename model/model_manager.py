@@ -233,19 +233,18 @@ class ARCEMEPipeline:
                 spacevar="koppen_geiger",
                 timevar=None,
                 k=1,
-                val_size=0.15,
                 seed=self.global_seed,
                 show=True,
                 save_path=self.run_dir,
-                val_size_if_k1=0.15,
+                val_size_if_k1=0.15
             )
             self.k_folds = 1
         # ============================
         elif self.cv_type == "holdout":
-            print(
-                "\n✂️ Creating single Hold-Out Split (85% Train / 15% Val) for FINAL MODEL..."
-            )
+            print("\n✂️ Creating single Hold-Out Split (85% Train / 15% Val) for FINAL MODEL...")
 
+
+            
         else:
             raise ValueError(f"Unknown CV type: {self.cv_type}")
 
