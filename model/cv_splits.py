@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.patches import Patch
@@ -19,6 +19,7 @@ def create_spacetime_folds(
     seed=42,
     show=True,
     save_path=None,
+    val_size_if_k1=0.15,
 ):
     """
     Python translation of CAST::CreateSpacetimeFolds (Meyer et al., 2018).
@@ -50,7 +51,6 @@ def create_spacetime_folds(
     valid_cube_ids = []
     for path in valid_zarrs_paths:
         filename = os.path.basename(path)
-        # Extrahiert die ID (z.B. 2020-0218-GTM)
         cube_id = filename.split("_postprocessed")[0].split(".zarr")[0]
         valid_cube_ids.append(cube_id)
 
@@ -83,23 +83,37 @@ def create_spacetime_folds(
     vis_matrix = np.zeros((k, len(unique_groups)))
     annot_matrix = np.full((k, len(unique_groups)), "", dtype=object)
 
-    # 1. Handle Class Stratification (if clusters should be distributed evenly across a class)
+    # =========================================================================
+    # 1. Handle Class Stratification
+    # =========================================================================
     if classvar is not None:
         if pd.api.types.is_numeric_dtype(df[classvar]):
             raise ValueError("Argument 'classvar' only works for categorical data")
 
         unit = df[[spacevar, classvar]].drop_duplicates().reset_index(drop=True)
-        skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
-
         unit["CAST_fold"] = -1
-        for fold_idx, (_, test_idx) in enumerate(skf.split(unit, unit[classvar])):
-            unit.loc[test_idx, "CAST_fold"] = fold_idx
+
+        if k == 1:
+            # Special case: k=1 -<
+            _, test_idx = train_test_split(
+                unit.index,
+                test_size=val_size_if_k1,
+                stratify=unit[classvar],
+                random_state=seed,
+            )
+            unit.loc[test_idx, "CAST_fold"] = 0
+        else:
+            skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+            for fold_idx, (_, test_idx) in enumerate(skf.split(unit, unit[classvar])):
+                unit.loc[test_idx, "CAST_fold"] = fold_idx
 
         # Merge back to assign the folds
         df = df.merge(unit, on=[spacevar, classvar], how="left")
         spacevar = "CAST_fold"
 
+    # =========================================================================
     # 2. Adjust 'k' if it's larger than available unique units
+    # =========================================================================
     if spacevar is not None:
         unique_space = df[spacevar].unique()
         if k > len(unique_space):
@@ -116,22 +130,43 @@ def create_spacetime_folds(
                 f"Warning: k is higher than number of unique points in time. k is set to {k}"
             )
 
+    # =========================================================================
     # 3. Split unique space and time units into K folds
+    # =========================================================================
     spacefolds = []
     if spacevar is not None:
-        kf_space = KFold(n_splits=k, shuffle=True, random_state=seed)
         unique_space = df[spacevar].unique()
-        for _, test_idx in kf_space.split(unique_space):
-            spacefolds.append(unique_space[test_idx])
+        if k == 1:
+            if classvar is not None:
+                spacefolds.append(
+                    np.array([0])
+                )  # '0' markiert die Test-Indizes von oben
+            else:
+                _, test_space = train_test_split(
+                    unique_space, test_size=val_size_if_k1, random_state=seed
+                )
+                spacefolds.append(test_space)
+        else:
+            kf_space = KFold(n_splits=k, shuffle=True, random_state=seed)
+            for _, test_idx in kf_space.split(unique_space):
+                spacefolds.append(unique_space[test_idx])
 
     timefolds = []
     if timevar is not None:
-        kf_time = KFold(n_splits=k, shuffle=True, random_state=seed)
         unique_time = df[timevar].unique()
-        for _, test_idx in kf_time.split(unique_time):
-            timefolds.append(unique_time[test_idx])
+        if k == 1:
+            _, test_time = train_test_split(
+                unique_time, test_size=val_size_if_k1, random_state=seed
+            )
+            timefolds.append(test_time)
+        else:
+            kf_time = KFold(n_splits=k, shuffle=True, random_state=seed)
+            for _, test_idx in kf_time.split(unique_time):
+                timefolds.append(unique_time[test_idx])
 
+    # =========================================================================
     # 4. Combine Space and Time Folds
+    # =========================================================================
     for i in range(k):
         if timevar is not None and spacevar is not None:
             # LLTO (Leave-Location-and-Time-Out)

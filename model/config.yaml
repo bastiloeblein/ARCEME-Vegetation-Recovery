@@ -1,4 +1,4 @@
-experiment_name: "Final_Model_SGConvLSTM_Indices_llto_strict"
+experiment_name: "Final_Model_SGEDConvLSTM_Indices_full_dataset"
 data:
   train_data_dir: "/net/projects/arceme/vegetation_recovery_prediction/data/final/train" #"/scratch/sloeblein/postprocessed" #/net/projects/arceme/vegetation_recovery_prediction/postprocessed"
   train_test_split: "data_processing/data/train_test_split.csv"
@@ -18,13 +18,13 @@ data:
   variables:
     s2:
       - "kNDVI"
-      # - "B02"
-      # - "B03"
-      # - "B04"
-      # - "B8A"
-      - "IRECI"
-      - "NDMI"
-      - "NIRv"  # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
+      - "B02"
+      - "B03"
+      - "B04"
+      - "B8A"
+      # - "IRECI"
+      # - "NDMI"
+      # - "NIRv"  # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
     s1:
       - "vv"
       - "vh"
@@ -44,7 +44,7 @@ data:
   data_loader:
     num_workers: 12
 training:
-  seed: 42
+  seed: 777
   optimizer:
     name: "adamW"
     start_learn_rate: 0.0001
@@ -80,7 +80,7 @@ training:
     min_pixel_threshold: 0.15 #  Minimum pixel threshold, so a cube is consider for validation metric calculation
     log_timestep_metrics: False # Whether to log timestep-wise metrics across all cubes during validation/testing
 model:
-  model_type: "SGConvLSTM"
+  model_type: "SGEDConvLSTM"
   checkpoint_path: None
   output_channels: 1      # We want to predict 1 channel (kNDVI)
   hidden_channels:
@@ -96,7 +96,7 @@ model:
 cross_validation:
   enabled: True
   k_folds: 3
-  type: "llto_strict" # llto_strict
+  type: "llto_holdout" # llto_strict, llto, llto_holdout
 testing:
   save_tensors: False # Whether to save prediction and target tensors during testing for detailed analysis
   save_metrics: False # Whether to save computed metrics during testing for detailed analysis
