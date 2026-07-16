@@ -311,6 +311,8 @@ def validate_index_against_masks(ds, index_var):
         print(f"✅ {index_var} within plausible range: [{v_min:.4f}, {v_max:.4f}]")
 
 
+# I think here I should have set the masked pixels to a new LC class -> so it also makes sense that I define 12 in one hot later on
+# Fix
 def filter_static_vegetation_outliers(
     ds, threshold_pct=0.75, time_dim="time_sentinel_2_l2a"
 ):
@@ -373,15 +375,26 @@ def integrate_veg_and_wrongly_classified_mask(
     ds: xr.Dataset, mask_name="static_veg_filter"
 ) -> xr.Dataset:
     """
-    Updates the vegetation mask by removing misclassified pixels
-    and cleans up the temporary static mask.
+    Removes persistently non-vegetated pixels from the vegetation mask
+    and assigns them the auxiliary ESA_LC label 0.
     """
-    static_mask_2d = ds[mask_name]
+    original_veg_mask = ds["is_veg"].astype(bool)
+    static_valid_mask = ds[mask_name].astype(bool)
 
-    # Use bitwise multiplication to keep it uint8 and ensure correct broadcasting
-    ds["is_veg"] = (ds["is_veg"] & static_mask_2d).astype("uint8")
+    refined_veg_mask = original_veg_mask & static_valid_mask
 
-    # Cleanup: The static mask's information is now baked into 'is_veg'
+    # Only pixels originally classified as vegetation but rejected
+    # by the optical time-series filter are relabelled.
+    rejected_vegetation = original_veg_mask & ~refined_veg_mask
+
+    ds["ESA_LC"] = xr.where(
+        rejected_vegetation,
+        0,
+        ds["ESA_LC"],
+    ).astype("uint8")
+
+    ds["is_veg"] = refined_veg_mask.astype("uint8")
+
     ds = ds.drop_vars(mask_name, errors="ignore")
 
     return ds
