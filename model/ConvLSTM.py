@@ -22,7 +22,16 @@ def _extend_for_multilayer(param, num_layers):
 
 class ConvLSTMCell(nn.Module):
 
-    def __init__(self, input_dim, hidden_dim, kernel_size, dilation, layer_norm_flag):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        kernel_size,
+        dilation,
+        layer_norm_flag,
+        peephole=False,
+        memory_kernel_size=None,
+    ):
         """
         input_dim: Anzahl der Kanäle, die reinkommen (deine 34).
         hidden_dim: Wie groß das Gedächtnis pro Pixel sein soll (z.B. 64).
@@ -39,6 +48,8 @@ class ConvLSTMCell(nn.Module):
         self.kernel_size = kernel_size
         self.dilation = dilation
         self.layer_norm_flag = layer_norm_flag
+        self.peephole = peephole
+        self.memory_kernel_size = memory_kernel_size or kernel_size
 
         self.conv = nn.Conv2d(
             in_channels=self.input_dim
@@ -51,6 +62,17 @@ class ConvLSTMCell(nn.Module):
             dilation=self.dilation,
             bias=True,  # Adds learnable bias to the output
         )
+
+        if self.peephole:
+            self.memory_conv = nn.Conv2d(
+                in_channels=self.hidden_dim,
+                out_channels=3 * self.hidden_dim,
+                kernel_size=self.memory_kernel_size,
+                padding="same",
+                padding_mode="reflect",
+                dilation=self.dilation,
+                bias=False,
+            )
 
         if self.layer_norm_flag:
             self.layer_norm = nn.InstanceNorm2d(
@@ -71,8 +93,6 @@ class ConvLSTMCell(nn.Module):
         )
         # c_cur (Cell State): Is Longterm memory. Internal memory, which stays stable over long periods
 
-        # --- DEBUG: Interne Werte prüfen ---
-        # Wir schauen uns an, wie groß die Zahlen sind, bevor wir rechnen
         if torch.isnan(h_cur).any() or torch.isnan(c_cur).any():
             print("⚠️ NAN DETECTED in ConvLSTMCell input!")
 
@@ -98,6 +118,16 @@ class ConvLSTMCell(nn.Module):
         # cc_i (Input Gate): Decides, which new information from this timestep is relevant
         # cc_g (New Info): Calculates the new values
         # cc_o (Output Gate): Decides, what we pass as h_next (visible result)
+
+        # Optional direct cell-state-to-gate connections (peepholes).
+        if self.peephole:
+            memory_conv = self.memory_conv(c_cur)
+            memory_i, memory_f, memory_o = torch.split(
+                memory_conv, self.hidden_dim, dim=1
+            )
+            cc_i = cc_i + memory_i
+            cc_f = cc_f + memory_f
+            cc_o = cc_o + memory_o
 
         # Activation function
         i = torch.sigmoid(cc_i)  # Sigmoid transforms all number between 0 and 1
@@ -128,6 +158,8 @@ class ConvLSTMCell(nn.Module):
             self.conv.bias.data[h : 2 * h].fill_(
                 1.0
             )  # set bias of forget gate to 1.0 -> at beginning model keeps information
+        if self.peephole:
+            nn.init.orthogonal_(self.memory_conv.weight)
 
     def init_hidden(self, batch_size, height, width):
         # Erzeuge neutrale Nullen direkt auf dem richtigen Device
@@ -154,6 +186,8 @@ class SGEDConvLSTM(nn.Module):
         baseline="last_frame",
         dropout_prob=0.0,
         layer_norm_flag=False,
+        peephole=False,
+        memory_kernel_size=None,
     ):
         """
         input_dim: Channels in context tensor (z.B. 34)
@@ -177,6 +211,8 @@ class SGEDConvLSTM(nn.Module):
         self.num_layers = num_layers
         self.baseline = baseline
         self.layer_norm_flag = layer_norm_flag
+        self.peephole = peephole
+        self.memory_kernel_size = memory_kernel_size or kernel_size
 
         # self.batch_norms = nn.ModuleList([
         #     nn.BatchNorm2d(hidden_dims[i]) for i in range(self.num_layers)
@@ -200,6 +236,8 @@ class SGEDConvLSTM(nn.Module):
                     self.kernel_size,
                     self.dilation,
                     self.layer_norm_flag,
+                    self.peephole,
+                    self.memory_kernel_size,
                 )
             )
 
@@ -214,6 +252,8 @@ class SGEDConvLSTM(nn.Module):
                     self.kernel_size,
                     self.dilation,
                     self.layer_norm_flag,
+                    self.peephole,
+                    self.memory_kernel_size,
                 )
             )
 
@@ -393,6 +433,8 @@ class SGConvLSTM(nn.Module):
         baseline="last_frame",
         dropout_prob=0.0,
         layer_norm_flag=False,
+        peephole=False,
+        memory_kernel_size=None,
     ):
         super(SGConvLSTM, self).__init__()
 
@@ -408,6 +450,8 @@ class SGConvLSTM(nn.Module):
         self.layer_norm_flag = layer_norm_flag
         self.baseline = baseline
         self.dropout_prob = dropout_prob
+        self.peephole = peephole
+        self.memory_kernel_size = memory_kernel_size or kernel_size
 
         # self.batch_norms = nn.ModuleList([
         #     nn.BatchNorm2d(hidden_dims[i]) for i in range(self.num_layers)
@@ -430,6 +474,8 @@ class SGConvLSTM(nn.Module):
                     self.kernel_size,
                     self.dilation,
                     cur_layer_norm_flag,
+                    self.peephole,
+                    self.memory_kernel_size,
                 )
             )
 

@@ -48,6 +48,10 @@ class ConvLSTM_Model(pl.LightningModule):
             "baseline": cfg["model"]["baseline"],
             "dropout_prob": cfg["model"].get("dropout_prob", 0.0),
             "layer_norm_flag": cfg["model"].get("layer_norm", False),
+            "peephole": cfg["model"].get("peephole", False),
+            "memory_kernel_size": cfg["model"].get(
+                "memory_kernel", cfg["model"]["kernel"]
+            ),
         }
 
         # Initialize the specific model class
@@ -72,7 +76,7 @@ class ConvLSTM_Model(pl.LightningModule):
             ), f"SGConvLSTM requires hidden_dims list length ({len(model_params['hidden_dims'])}) to match n_layers ({model_params['num_layers']})"
             self.model = SGConvLSTM(**model_params)
 
-        # 3. 3. Loss & Optimizer configuration
+        # 3. Loss & Optimizer configuration
         self.lr = cfg["training"]["optimizer"]["start_learn_rate"]
         self.training_loss = get_loss_from_name(
             cfg["training"]["training_loss"]["loss_function"]
@@ -277,6 +281,7 @@ class ConvLSTM_Model(pl.LightningModule):
         cube_ids = meta["cube_id"]
         tops = meta["top"]
         lefts = meta["left"]
+        eligible_veg_masks = meta["eligible_veg"]
 
         # Store raw outputs for stitching at on_validation_epoch_end.
         # Moving tensors to CPU prevents CUDA Out-Of-Memory errors.
@@ -292,6 +297,10 @@ class ConvLSTM_Model(pl.LightningModule):
                     "baseline": persistence_baseline[i]
                     .detach()
                     .cpu(),  # Shape: [T, 1, H, W]
+                    "eligible_veg": eligible_veg_masks[i]
+                    .detach()
+                    .cpu()
+                    .bool(),  # Shape: [H, W]
                 }
             )
 
@@ -865,8 +874,9 @@ class ConvLSTM_Model(pl.LightningModule):
             optimizer,
             mode=self.cfg["training"]["validation"]["monitor_mode"],
             factor=self.cfg["training"]["optimizer"]["lr_factor"],
-            patience=self.cfg["training"]["optimizer"]["patience"],
+            patience=self.cfg["training"]["optimizer"]["scheduler_patience"],
             threshold=self.cfg["training"]["optimizer"]["lr_threshold"],
+            min_lr=self.cfg["training"]["optimizer"].get("min_lr", 1e-6),
         )
 
         return {

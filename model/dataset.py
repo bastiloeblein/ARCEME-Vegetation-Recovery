@@ -55,6 +55,15 @@ class ARCEME_Dataset(Dataset):
         self.fixed_tiles = fixed_tiles
         self.use_augmentation = use_augmentation
 
+        # Get quality config params
+        quality_cfg = self.cfg["data"].get("quality_check", {})
+        self.patch_max_retries = int(quality_cfg.get("patch_max_retries", 15))
+        self.cube_resample_attempts = int(quality_cfg.get("cube_resample_attempts", 4))
+        if self.patch_max_retries < 1 or self.cube_resample_attempts < 1:
+            raise ValueError(
+                "patch_max_retries and cube_resample_attempts must both be at least 1."
+            )
+
         # Variable configuration
         self.s2_vars = s2_vars or []
         self.s1_vars = s1_vars or []
@@ -78,9 +87,9 @@ class ARCEME_Dataset(Dataset):
         """
         Returns the total number of samples in the dataset.
 
-        For training, the length is calculated to ensure full spatial coverage
-        of the 1000x1000 cubes based on the patch size. For validation,
-        it returns the number of pre-defined fixed tiles.
+        For training, the length gives a nominal number of random samples per
+        cube per epoch; random cropping does not guarantee full coverage. For
+        validation, it returns the number of pre-defined fixed tiles.
         """
         if self.fixed_tiles is not None:
             return len(self.fixed_tiles)
@@ -214,7 +223,19 @@ class ARCEME_Dataset(Dataset):
 
         return filtered_paths
 
-    def _get_random_patch_coords(self, h, w, ds, max_retries=15):
+    @staticmethod
+    def _open_cube(path):
+        """Open one Zarr cube, falling back when consolidated metadata is unavailable."""
+        try:
+            return xr.open_zarr(path, consolidated=True)
+        except Exception:
+            print(
+                f"WARNING: Failed to open {path} with consolidated=True. "
+                "Retrying with consolidated=False."
+            )
+            return xr.open_zarr(path, consolidated=False)
+
+    def _get_random_patch_coords(self, h, w, ds, max_retries=None):
         """
         Finds suitable spatial coordinates (top, left) for a patch using rejection sampling.
 
@@ -224,13 +245,29 @@ class ARCEME_Dataset(Dataset):
         Args:
             h, w (int): Height and width of the source cube (usually 1000, 1000).
             ds (xr.Dataset): The lazy-loaded Xarray dataset of the current cube.
-            max_retries (int): Maximum number of random attempts before returning the best found patch.
+            max_retries (int, optional): Maximum number of random attempts.
+                Defaults to ``data.quality_check.patch_max_retries``.
 
         Returns:
-            tuple: (top, left) coordinate
+            tuple | None: (top, left) coordinate. ``None`` means none of the
+            sampled patches had a loss-valid target pixel and the caller must
+            resample another training cube.
         """
-        best_patch = (0, 0)
-        max_score = -1
+        if max_retries is None:
+            max_retries = self.patch_max_retries
+
+        max_top = h - self.patch_size
+        max_left = w - self.patch_size
+        if max_top < 0 or max_left < 0:
+            raise ValueError(
+                f"Patch size {self.patch_size} exceeds cube dimensions ({h}x{w})."
+            )
+
+        # Only retain fallback candidates that contain at least one valid
+        # target pixel-time under the exact loss mask.
+        best_patch = None
+        best_rank = None
+        best_target_valid_count = 0
 
         # Extract thresholds from config
         # A timestep is "good" if it has more valid pixels than this ratio
@@ -249,14 +286,19 @@ class ARCEME_Dataset(Dataset):
         min_tgt_steps = self.cfg["data"]["quality_check"]["tgt_min_timesteps"]
 
         cutoff_date = pd.to_datetime(ds.attrs["precip_end_date"])
+        cube_id = ds.attrs.get("cube_id", "unknown")
 
         for i in range(max_retries):
             # 1. Randomly sample coordinates
-            top = torch.randint(0, h - self.patch_size, (1,)).item()
-            left = torch.randint(0, w - self.patch_size, (1,)).item()
+            top = torch.randint(0, max_top + 1, (1,)).item()
+            left = torch.randint(0, max_left + 1, (1,)).item()
 
             # 2. Extract masks for the spatial patch (lazy loading)
             patch_mask_s2 = ds["mask_s2"].isel(
+                y=slice(top, top + self.patch_size),
+                x=slice(left, left + self.patch_size),
+            )
+            patch_target_mask = ds["target_mask"].isel(
                 y=slice(top, top + self.patch_size),
                 x=slice(left, left + self.patch_size),
             )
@@ -265,19 +307,20 @@ class ARCEME_Dataset(Dataset):
                 x=slice(left, left + self.patch_size),
             )
 
-            # 3. Combine cloud mask and vegetation mask
-            # Result is 1 only where pixels are visible AND contain vegetation
-            valid_mask = patch_mask_s2 * patch_is_veg
+            # 3. Combine masks with vegetation. Use target_mask for the
+            # target window so the sampler matches the actual loss mask.
+            valid_context_mask = patch_mask_s2 * patch_is_veg
+            valid_target_mask = patch_target_mask * patch_is_veg
 
             # 4. Temporal slicing (Context and Target)
             m_ctx = (
-                valid_mask.sel(time_sentinel_2_l2a=slice(None, cutoff_date))
+                valid_context_mask.sel(time_sentinel_2_l2a=slice(None, cutoff_date))
                 .tail(time_sentinel_2_l2a=self.context_len)
                 .values
             )
             m_tgt = (
-                valid_mask.where(
-                    valid_mask.time_sentinel_2_l2a > cutoff_date, drop=True
+                valid_target_mask.where(
+                    valid_target_mask.time_sentinel_2_l2a > cutoff_date, drop=True
                 )
                 .head(time_sentinel_2_l2a=self.target_len)
                 .values
@@ -290,37 +333,55 @@ class ARCEME_Dataset(Dataset):
             # Count "good" timesteps based on pixel threshold
             n_good_ctx = np.sum(ctx_valid_per_step >= valid_pixel_thresh_ctx)
             n_good_tgt = np.sum(tgt_valid_per_step >= valid_pixel_thresh_tgt)
+            target_valid_count = int(np.count_nonzero(m_tgt))
 
             # 6. Scoring and Selection
             # Score weights target steps more heavily as they are critical for recovery prediction
             current_score = (n_good_ctx * 1.0) + (n_good_tgt * 5.0)
 
             # Check if patch meets hard criteria from config (minimum number of good timesteps)
-            if n_good_ctx >= min_ctx_steps and n_good_tgt >= min_tgt_steps:
+            if (
+                target_valid_count > 0
+                and n_good_ctx >= min_ctx_steps
+                and n_good_tgt >= min_tgt_steps
+            ):
                 return top, left
 
             # Log only if it fails the first time
-            cube_id = ds.attrs["cube_id"]
             if i == 0:
                 print(
                     f"DATALOADER: Cube {cube_id}: Patch does not match criteria, retrying..."
                 )
             elif i % 5 == 0:  # Log every 5th fail to avoid spam
                 print(
-                    f"DATALOADER: Cube {cube_id}: Still looking for a valid patch (Attempt {i+1}/15)..."
+                    f"DATALOADER: Cube {cube_id}: Still looking for a valid patch "
+                    f"(attempt {i + 1}/{max_retries})..."
                 )
 
-            # Keep track of the best effort if criteria aren't met
-            if current_score > max_score:
-                max_score = current_score
+            # Keep the best fallback only when it has a non-empty loss mask.
+            # The score retains the previous timestep-priority behaviour; the
+            # valid target count breaks ties in favour of more supervision.
+            candidate_rank = (float(current_score), target_valid_count)
+            if target_valid_count > 0 and (
+                best_rank is None or candidate_rank > best_rank
+            ):
+                best_rank = candidate_rank
                 best_patch = (top, left)
+                best_target_valid_count = target_valid_count
 
-        # Fallback: Return best effort if no patch met the strict criteria
+        if best_patch is not None:
+            print(
+                f"DATALOADER: Cube {cube_id}: no patch met the strict quality "
+                f"criteria after {max_retries} attempts; using the best fallback "
+                f"with {best_target_valid_count} valid target pixel-times."
+            )
+            return best_patch
+
         print(
-            f"DEBUG: Cube {cube_id} - No patch met criteria, returning best effort with score:",
-            max_score,
+            f"DATALOADER: Cube {cube_id}: rejecting sampled cube because none of "
+            f"{max_retries} patches contained a valid target pixel-time."
         )
-        return best_patch
+        return None
 
     def __getitem__(self, idx):
         """
@@ -346,25 +407,48 @@ class ARCEME_Dataset(Dataset):
             path = self.cube_paths[real_idx]
 
         # ======================================================================
-        # 2. DATA LOADING & SPATIAL SLICING
-        # ======================================================================
-        try:
-            ds = xr.open_zarr(path, consolidated=True)
-        except Exception:
-            print(
-                f"WARNING: Failed to open {path} with consolidated=True. Retrying with consolidated=False."
-            )
-            ds = xr.open_zarr(path, consolidated=False)
-
-        # ======================================================================
-        # 3. RANDOM PATCHING WITH QUALITY CHECK (Training only)
+        # 2. DATA LOADING & RANDOM PATCHING (Training only)
         # ======================================================================
         if self.train:
-            # Pass ds to filter function
-            top, left = self._get_random_patch_coords(self.h, self.w, ds)
+            # A cube can be very cloudy or have no valid future vegetation at
+            # all. Never let its fallback patch silently create a zero-loss
+            # training sample: try a bounded number of cube/patch candidates.
+            initial_path = path
+            ds = None
+            for cube_attempt in range(self.cube_resample_attempts):
+                if cube_attempt > 0:
+                    resample_idx = torch.randint(0, len(self.cube_paths), (1,)).item()
+                    path = self.cube_paths[resample_idx]
+
+                ds = self._open_cube(path)
+                coords = self._get_random_patch_coords(self.h, self.w, ds)
+                if coords is not None:
+                    top, left = coords
+                    if cube_attempt > 0:
+                        print(
+                            f"DATALOADER: Resampled training cube after {cube_attempt} "
+                            f"rejected candidate(s): {path}"
+                        )
+                    break
+
+                ds.close()
+                ds = None
+
+            if ds is None:
+                raise RuntimeError(
+                    "Could not sample a training patch with any valid target "
+                    f"pixel-time after {self.cube_resample_attempts} cube attempts "
+                    f"and {self.patch_max_retries} patch attempts per cube. "
+                    f"Initial cube: {initial_path}. Exclude this cube or revise the "
+                    "training quality thresholds."
+                )
+        else:
+            # Validation/test tiles are fixed and are deliberately never
+            # rejected here; their masks determine metric eligibility later.
+            ds = self._open_cube(path)
 
         # ======================================================================
-        # 4. SPATIAL SLICING
+        # 3. SPATIAL SLICING
         # ======================================================================
         ds = ds.isel(
             y=slice(top, top + self.patch_size), x=slice(left, left + self.patch_size)
@@ -750,6 +834,26 @@ class ARCEME_Dataset(Dataset):
             path,
         )
 
+        # Spatial denominator for cube-wise validation coverage.  This is kept
+        # separate from target_mask: target_mask is zero for both clouds and
+        # non-vegetated locations, whereas coverage must be relative to the
+        # eligible vegetation area only.  is_veg is static in the processed
+        # cubes; any() also makes the intent safe if a legacy cube repeats it
+        # over the target time dimension.
+        eligible_veg = is_veg_target.bool().any(dim=0)
+
+        # Training samples must carry supervision. Validation/test tiles remain
+        # untouched because complete reconstruction and later metric masking
+        # require every deterministic tile, including fully invalid ones.
+        if self.train:
+            n_valid_target = int(torch.count_nonzero(target_mask).item())
+            if n_valid_target == 0:
+                ds.close()
+                raise RuntimeError(
+                    "Training sampler produced a patch with an empty loss mask "
+                    f"despite rejection sampling: path={path}, top={top}, left={left}."
+                )
+
         # ======================================================================
         # 9. BASELINE LOGIC (Last-Frame)
         # ======================================================================
@@ -802,7 +906,13 @@ class ARCEME_Dataset(Dataset):
         # Get cube_id
         match = re.search(pattern, path)
         cube_id = match.group(0) if match else "No_ID_Found"
-        meta = {"top": top, "left": left, "path": path, "cube_id": cube_id}
+        meta = {
+            "top": top,
+            "left": left,
+            "path": path,
+            "cube_id": cube_id,
+            "eligible_veg": eligible_veg,
+        }
 
         # ======================================================================
         # FINAL CROSS-CHECK ASSERTS (Alignment Context vs Future)
