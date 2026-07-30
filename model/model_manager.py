@@ -3,6 +3,7 @@ import sys
 import json
 import yaml
 import random
+import re
 from my_utils.warmup import ConfigWarmupCallback
 import numpy as np
 from pathlib import Path
@@ -122,6 +123,10 @@ class ARCEMEPipeline:
             self.k_folds = 1
             self.cv_type = "none"
 
+        # final refit without validation loader.
+        self.final_refit_cfg = self.cfg["training"].get("final_refit", {})
+        self.is_final_refit = bool(self.final_refit_cfg.get("enabled", False))
+
         self._calculate_dynamic_channels()
 
     def _calculate_dynamic_channels(self):
@@ -158,6 +163,19 @@ class ARCEMEPipeline:
                 d for d in os.listdir(self.processed_dir) if d.endswith(".zarr")
             ]
             return [os.path.join(self.processed_dir, z) for z in all_zarrs]
+
+        # Reuse the exact manifest when a final refit is restarted.
+        # Unlike CV, this manifest has one all-training-cubes list and no folds.
+        final_refit_manifest_path = os.path.join(
+            self.run_dir, "final_refit_manifest.json"
+        )
+        if self.is_final_refit and os.path.exists(final_refit_manifest_path):
+            print(
+                "♻️ Found final_refit_manifest.json. Reusing the exact final-refit "
+                "training cubes."
+            )
+            with open(final_refit_manifest_path, "r") as f:
+                return json.load(f)["train_files"]
 
         # --- Train Mode: Check if splits already exist (Resume Case) ---
         print(f"\n🔍 Scanning {self.mode.upper()} directory: {self.processed_dir}")
@@ -200,6 +218,18 @@ class ARCEMEPipeline:
             f"📊 Stats: Total: {len(all_zarrs)} | Excluded: {len(excluded_ids)} | Valid: {len(valid_zarrs_paths)}"
         )
 
+        if self.is_final_refit:
+            # Store complete, quality-filtered training set used for the final training run. 
+            final_refit_manifest = {
+                "train_files": [str(path) for path in valid_zarrs_paths],
+                "num_train": len(valid_zarrs_paths),
+                "seed": self.global_seed,
+            }
+            with open(final_refit_manifest_path, "w") as f:
+                json.dump(final_refit_manifest, f, indent=2)
+            print(f"✅ Final-refit manifest saved: {final_refit_manifest_path}")
+            return valid_zarrs_paths
+
         # Create Splits based on defined strategy
         if self.cv_type == "llto":
             print("\n✂️ Creating LLTO Cross-Validation Splits...")
@@ -239,11 +269,6 @@ class ARCEMEPipeline:
                 val_size_if_k1=0.15,
             )
             self.k_folds = 1
-        # ============================
-        elif self.cv_type == "holdout":
-            print(
-                "\n✂️ Creating single Hold-Out Split (85% Train / 15% Val) for FINAL MODEL..."
-            )
 
         else:
             raise ValueError(f"Unknown CV type: {self.cv_type}")
@@ -266,13 +291,9 @@ class ARCEMEPipeline:
 
         return all_folds
 
-    def get_dataloaders(self, train_files, val_files, fold_idx):
-        # Define fixed patches for validation
-        val_tiles = get_val_tiles_auto(
-            val_files, patch_size=self.cfg["data"]["patch_size"]
-        )
-
-        # Create Datasets
+    def get_train_dataloader(self, train_files, fold_idx=0):
+        """Create the augmented random-crop training loader without validation data."""
+        # Loader for the final refit: All eligible training cubes are used and no validation data is held back
         train_ds = ARCEME_Dataset(
             train_files,
             context_length=self.cfg["data"]["context_length"],
@@ -287,6 +308,27 @@ class ARCEMEPipeline:
             fixed_tiles=None,
             use_augmentation=self.cfg["training"]["use_augmentation"],
         )
+
+        g = torch.Generator()
+        g.manual_seed(self.global_seed + fold_idx)
+
+        return DataLoader(
+            train_ds,
+            batch_size=self.cfg["training"]["batch_size"],
+            shuffle=True,
+            num_workers=self.cfg["data"]["data_loader"]["num_workers"],
+            pin_memory=True,
+            worker_init_fn=seed_worker,
+            generator=g,
+        )
+
+    def get_dataloaders(self, train_files, val_files, fold_idx):
+        # Define fixed patches for validation
+        val_tiles = get_val_tiles_auto(
+            val_files, patch_size=self.cfg["data"]["patch_size"]
+        )
+
+        # Create Datasets
         val_ds = ARCEME_Dataset(
             val_files,
             context_length=self.cfg["data"]["context_length"],
@@ -302,21 +344,7 @@ class ARCEMEPipeline:
             use_augmentation=False,
         )
 
-        # Seed workers for reproducibility
-        # Assures that the same patches are sampled for training across different runs/folds when using the same seed
-        # But do I even want this??
-        g = torch.Generator()
-        g.manual_seed(self.global_seed + fold_idx)
-
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=self.cfg["training"]["batch_size"],
-            shuffle=True,
-            num_workers=self.cfg["data"]["data_loader"]["num_workers"],
-            pin_memory=True,  # alles ab hier optional - nochmal checken ob ich brauche
-            worker_init_fn=seed_worker,
-            generator=g,
-        )
+        train_loader = self.get_train_dataloader(train_files, fold_idx)
         val_loader = DataLoader(
             val_ds,
             batch_size=self.cfg["training"]["batch_size"],
@@ -374,7 +402,18 @@ class ARCEMEPipeline:
         return None
 
     def get_best_overall_checkpoint(self):
-        """Scans the run_dir to find the absolutely best checkpoint across all completed folds."""
+        """Scans the run_dir to find the absolutely best checkpoint across all completed folds.""".
+        # If final refit: get the final checkpoint after pre-specified number of epochs
+        final_refit_summary_path = os.path.join(
+            self.run_dir, "final_refit_summary.json"
+        )
+        if os.path.exists(final_refit_summary_path):
+            with open(final_refit_summary_path, "r") as f:
+                final_refit_summary = json.load(f)
+            final_checkpoint = final_refit_summary.get("final_checkpoint")
+            if final_checkpoint and os.path.exists(final_checkpoint):
+                return final_checkpoint
+
         # Check if the summary file exists (means training finished cleanly)
         summary_path = os.path.join(self.run_dir, "cv_summary.json")
         if os.path.exists(summary_path):
@@ -415,6 +454,9 @@ class ARCEMEPipeline:
 
     def run_cv(self, start_fold=0, resume_from_type="last"):
         """Executes the CV loop. Handles resuming automatically."""
+        if self.is_final_refit:
+            return self.run_final_refit()
+
         # Get valid paths and cv splits
         all_folds = self.prepare_data()
 
@@ -449,7 +491,7 @@ class ARCEMEPipeline:
             wandb_logger = WandbLogger(
                 project=self.cfg.get("wandb", {}).get(
                     "project", "ARCEME_kNDVI_Prediction"
-                ),  # CHANGED: project is configured centrally in config.yaml
+                ), 
                 name=f"{self.cfg['experiment_name']}_fold_{fold_idx}",
                 group=self.cfg["experiment_name"],
                 # model_type  =self.cfg["model"]["model_type"],
@@ -546,6 +588,9 @@ class ARCEMEPipeline:
                     "fold": fold_idx,
                     "best_score": best_score,
                     "best_checkpoint": checkpoint_callback.best_model_path,
+                    "best_epoch": self._get_checkpoint_epoch(
+                        checkpoint_callback.best_model_path   # here the epoch is saved, to derive median best cv epoch for the final refit
+                    ),
                     "metrics": val_results,
                 }
             )
@@ -573,10 +618,147 @@ class ARCEMEPipeline:
                 ),
                 "std_val_score": float(np.std([r["best_score"] for r in fold_results])),
             }
+            best_epochs = [
+                result["best_epoch"]
+                for result in fold_results
+                if result["best_epoch"] is not None
+            ]
+            if best_epochs:
+                # Epoch indices are zero-based; the number for final refit is therefore: epoch + 1.
+                summary["recommended_final_refit_epochs"] = int(
+                    round(float(np.median(best_epochs)))
+                ) + 1
             summary_path = os.path.join(self.run_dir, "cv_summary.json")
             with open(summary_path, "w") as f:
                 json.dump(summary, f, indent=2)
             print(f"\n📊 CV Summary saved: {summary_path}")
+
+    @staticmethod
+    def _get_checkpoint_epoch(checkpoint_path):
+        """Extract Lightning's zero-based epoch from a standard checkpoint name."""
+        if not checkpoint_path:
+            return None
+        match = re.search(r"epoch=(\d+)", checkpoint_path)
+        return int(match.group(1)) if match else None
+
+    def run_final_refit(self):
+        """Fit one selected configuration on every eligible training cube.
+
+        Model selection must already be complete from CV. Consequently this
+        method intentionally has no validation loader, early stopping, or
+        validation-dependent learning-rate scheduler.
+        """
+        if self.mode != "train":
+            raise RuntimeError("Final refit is only available in training mode.")
+
+        epochs = self.final_refit_cfg.get("epochs")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(
+                "training.final_refit.epochs must be a positive integer. Set it "
+                "from the CV summary's recommended_final_refit_epochs before "
+                "starting the final refit."
+            )
+
+        train_files = self.prepare_data()
+        if not train_files:
+            raise RuntimeError("No eligible training cubes are available for final refit.")
+
+        print("\n" + "=" * 60)
+        print("🚀 STARTING FINAL REFIT (all eligible training cubes, no validation)")
+        print(f"With {len(train_files)} training cubes for exactly {epochs} epochs.")
+        print("=" * 60)
+
+        train_loader = self.get_train_dataloader(train_files)
+        model = ConvLSTM_Model(self.cfg)
+
+        wandb_logger = WandbLogger(
+            project=self.cfg.get("wandb", {}).get(
+                "project", "ARCEME_kNDVI_Prediction"
+            ),
+            name=f"{self.cfg['experiment_name']}_final_refit",
+            group=self.cfg["experiment_name"],
+            job_type="final_refit",
+            config=self.cfg,
+            resume="allow",
+        )
+
+        if os.path.exists(self.exclude_csv_path):
+            exclusion_artifact = wandb.Artifact(
+                name=f"exclusion_list_{self.cfg['experiment_name']}_final_refit",
+                type="dataset_metadata",
+            )
+            exclusion_artifact.add_file(self.exclude_csv_path)
+            wandb_logger.experiment.log_artifact(exclusion_artifact)
+
+        final_ckpt_dir = os.path.join(self.run_dir, "final_refit", "checkpoints")
+        # There is no best validation score to log (as there is no validation data), so save the last epoch only
+        final_checkpoint_callback = ModelCheckpoint(
+            dirpath=final_ckpt_dir,
+            filename="final-model-{epoch:03d}",
+            save_top_k=0,
+            save_last=True,
+        )
+        callbacks = [final_checkpoint_callback]
+        if (
+            self.cfg["training"]["optimizer"].get("warmup", {}).get("enabled", False)
+        ):
+            callbacks.insert(0, ConfigWarmupCallback(self.cfg))
+
+        trainer = Trainer(
+            accumulate_grad_batches=self.cfg["training"]["accumulate_grad_batches"],
+            log_every_n_steps=10,
+            gradient_clip_val=(
+                self.cfg["training"]["gradient_clipping"]["value"]
+                if self.cfg["training"]["gradient_clipping"]["enabled"]
+                else None
+            ),
+            gradient_clip_algorithm=(
+                self.cfg["training"]["gradient_clipping"]["algorithm"]
+                if self.cfg["training"]["gradient_clipping"]["enabled"]
+                else "norm"
+            ),
+            max_epochs=epochs,
+            accelerator=self.cfg["training"]["accelerator"],
+            devices=self.cfg["training"]["devices"],
+            precision=self.cfg["training"]["precision"],
+            logger=wandb_logger,
+            callbacks=callbacks,
+            enable_model_summary=True,
+        )
+
+        print_channel_info(
+            self.v_cfg["s2"],
+            self.v_cfg["s1"],
+            self.v_cfg["era5"],
+            self.v_cfg["static"],
+            expected_input_channels=self.cfg["model"]["input_channels"],
+        )
+        trainer.fit(model, train_loader)
+
+        final_checkpoint = final_checkpoint_callback.last_model_path
+        if not final_checkpoint or not os.path.exists(final_checkpoint):
+            raise RuntimeError("Final refit finished but no last checkpoint was saved.")
+
+        final_summary = {
+            "final_checkpoint": final_checkpoint,
+            "num_training_cubes": len(train_files),
+            "epochs": epochs,
+            "seed": self.global_seed,
+            "source_cv_run": self.final_refit_cfg.get("source_cv_run"),
+            "early_stopping": False,
+            "validation_used": False,
+        }
+        summary_path = os.path.join(self.run_dir, "final_refit_summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(final_summary, f, indent=2)
+
+        print(f"\n✅ Final refit complete. Checkpoint: {final_checkpoint}")
+        print(f"📊 Final-refit summary saved: {summary_path}")
+
+        del model, trainer, train_loader
+        torch.cuda.empty_cache()
+        wandb.finish()
+        return final_summary
 
     def evaluate(self, ckpt_path, test_files=None):
         """Evaluates a loaded model on test data."""

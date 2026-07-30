@@ -71,6 +71,10 @@ training:
   devices: 1
   precision: "16-mixed"  # 32
   use_augmentation: True
+  final_refit:
+    enabled: false
+    epochs: null    # set this to number of epochs recorded as `recommended_final_refit_epochs` in that CV run's summary for final refit, or null to use the same number as in the main training
+    source_cv_run: null
   training_loss:
     loss_function: "l1"
     alpha: 1  # 0.2   # Main train loss weight

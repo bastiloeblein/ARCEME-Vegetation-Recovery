@@ -987,6 +987,10 @@ class ConvLSTM_Model(pl.LightningModule):
             lr=self.cfg["training"]["optimizer"]["start_learn_rate"],
         )
 
+        if self.cfg["training"].get("final_refit", {}).get("enabled", False):
+            # Final refit has no validation, so we return only the optimizer without a scheduler.
+            return optimizer
+
         # Monitor metric that should defines validation performance
         # monitor_key = f"{self.cfg['training']['validation']['monitor']['split']}_{self.cfg['training']['validation']['monitor']['metric']}"
         monitor_key = self.cfg["training"]["validation"]["monitor"]["metric"]

@@ -52,7 +52,7 @@ def main():
         ablation_split_path=args.ablation_split_path,
     )
 
-    # Start Training
+    # `final_refit.enabled` routes to a no-validation fit on all quality-filtered training cubes; otherwise normal CV is run.
     pipeline.run_cv(start_fold=args.resume_fold, resume_from_type=args.resume_type)
 
 
@@ -70,3 +70,6 @@ if __name__ == "__main__":
 #       - CUDA_VISIBLE_DEVICES=X  python train.py --resume_run path/to/run_dir --resume_fold X --resume_type last
 # Start ABLATION STUDY (Fresh run, but with exact same folds as an old run):
 #       - CUDA_VISIBLE_DEVICES=X python train.py --ablation_split_path /pfad/zur/alten/cv_splits.json
+# Final refit after model selection by CV (configure final_refit.enabled and
+# final_refit.epochs in config.yaml first):
+#       - CUDA_VISIBLE_DEVICES=X python train.py
