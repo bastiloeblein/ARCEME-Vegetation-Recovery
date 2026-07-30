@@ -529,7 +529,7 @@ class ARCEMEPipeline:
                 enable_model_summary=True,  # zeigt die architektur und die anzahl der parameter an, könnte hilfreich sein
             )
 
-            print_channel_info(v_cfg["s2"], v_cfg["s1"], v_cfg["era5"], v_cfg["static"])
+            print_channel_info(v_cfg["s2"], v_cfg["s1"], v_cfg["era5"], v_cfg["static"], expected_input_channels=self.cfg["model"]["input_channels"],)
 
             # --- Start Training ---
             trainer.fit(model, train_loader, val_loader, ckpt_path=resume_ckpt)
