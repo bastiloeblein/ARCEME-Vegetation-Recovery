@@ -346,6 +346,27 @@ class ConvLSTM_Model(pl.LightningModule):
             "save_tensors", False
         )
 
+        # Get eligibility rules for the variance-based cube metrics NNSE and R2. 
+        validation_cfg = self.cfg["training"]["validation"]
+        min_valid_target_coverage = float(
+            validation_cfg.get(
+                "min_valid_target_coverage",
+                validation_cfg.get("min_pixel_threshold", 0.0),
+            )
+        )
+        min_valid_target_count = int(
+            validation_cfg.get("min_valid_target_count", 1)
+        )
+        min_target_variance = float(
+            validation_cfg.get("min_target_variance", 0.0)
+        )
+        if not 0.0 <= min_valid_target_coverage <= 1.0:
+            raise ValueError("min_valid_target_coverage must be in [0, 1].")
+        if min_valid_target_count < 1 or min_target_variance < 0.0:
+            raise ValueError(
+                "min_valid_target_count must be >= 1 and min_target_variance must be >= 0."
+            )
+
         # --- Global Storage for Metrics ---
         # Timestep-wise storage (to see how error evolves over time T)
         t_fut = self.validation_step_outputs[0]["y_pred"].shape[0]
@@ -364,8 +385,10 @@ class ConvLSTM_Model(pl.LightningModule):
             "y_pred_base": torch.zeros(t_fut),
         }
 
-        # Storage for Cube-wise (Macro) metrics
+        # Keep a complete per-cube audit, while each macro aggregate uses only the cubes for which that metric is defined.
         all_cube_metrics = []
+        macro_error_cube_metrics = []
+        macro_r2_nnse_cube_metrics = []
 
         # 2. Iterate and Stitch each Cube
         for cube_id, patches in cubes_data.items():
@@ -384,13 +407,14 @@ class ConvLSTM_Model(pl.LightningModule):
             true_cube = torch.zeros((t_fut, dim_max, dim_max), dtype=torch.float32)
             mask_cube = torch.zeros((t_fut, dim_max, dim_max), dtype=torch.float32)
             base_cube = torch.zeros((t_fut, dim_max, dim_max), dtype=torch.float32)
+            eligible_veg_cube = torch.zeros((dim_max, dim_max), dtype=torch.bool)
 
             # Stitching: Place patches into their spatial position
             for p in patches:
                 top, left = p["top"], p["left"]
                 bottom, right = top + patch_size, left + patch_size
 
-                # Assert we don't go out of bounds
+                # Assert that it doesnt go out of bounds
                 assert (
                     bottom <= dim_max and right <= dim_max
                 ), f"Patch bounds ({bottom}, {right}) exceed cube max ({dim_max})"
@@ -400,6 +424,12 @@ class ConvLSTM_Model(pl.LightningModule):
                 p_true = p["y_true"].squeeze(1)
                 p_mask = p["mask"].squeeze(1)
                 p_base = p["baseline"].squeeze(1)
+                p_eligible_veg = p["eligible_veg"].bool()
+                if p_eligible_veg.shape != (patch_size, patch_size):
+                    raise ValueError(
+                        f"eligible_veg has unexpected shape {p_eligible_veg.shape} "
+                        f"for cube {cube_id}."
+                    )
 
                 # Accumulate predictions and count overlaps
                 pred_cube[:, top:bottom, left:right] += p_pred
@@ -409,9 +439,14 @@ class ConvLSTM_Model(pl.LightningModule):
                 true_cube[:, top:bottom, left:right] = p_true
                 mask_cube[:, top:bottom, left:right] = p_mask
                 base_cube[:, top:bottom, left:right] = p_base
+                eligible_veg_cube[top:bottom, left:right] = p_eligible_veg
 
             # Average the overlapping predictions  (clamp to prevent division by zero, but this should not occur)
-            if count_cube.min() == 0:
+            has_uncovered_pixels = bool((count_cube == 0).any().item())
+            reconstruction_complete = (
+                len(patches) == expected_patches and not has_uncovered_pixels
+            )
+            if has_uncovered_pixels:
                 print(
                     f"⚠️ WARNING: Cube {cube_id} has uncovered pixels (count=0). This should not happen if patches fully cover the cube."
                 )
@@ -467,22 +502,6 @@ class ConvLSTM_Model(pl.LightningModule):
                     base_dir = self.cfg["data"]["train_data_dir"]
 
                 cube_path = os.path.join(base_dir, f"{cube_id}_postprocessed.zarr")
-
-                # ONLY FOR ABLATION STUDY - DELETE LATER!
-                # train_dir = self.cfg["data"]["train_data_dir"]
-                # test_dir = "/net/projects/arceme/vegetation_recovery_prediction/data/final/test"
-                # cube_filename = f"{cube_id}_postprocessed.zarr"
-
-                # # 1. Zuerst im Train-Ordner suchen
-                # cube_path = os.path.join(train_dir, cube_filename)
-
-                # # 2. Falls nicht in Train, dann im Test-Ordner suchen
-                # if not os.path.exists(cube_path):
-                #     cube_path = os.path.join(test_dir, cube_filename)
-
-                #     # Optional: Ein kleiner Sicherheits-Check, falls die Datei GANZ fehlt
-                #     if not os.path.exists(cube_path):
-                #         raise FileNotFoundError(f"❌ Cube {cube_filename} weder in Train noch in Test gefunden!")
 
                 # 2. Open cube and load is_veg
                 ds_cube = xr.open_zarr(cube_path)
@@ -588,10 +607,32 @@ class ConvLSTM_Model(pl.LightningModule):
             # Calculate Macro Metrics for this specific Cube (aggregated over all T)
             # (Total squared error across all timesteps / Total valid pixels across all timesteps)
             # Pixel based weithing (each pixel has same weight) - if one timestep has only few pixels, it will not bias the overall metric for the cube
-            total_cube_pixels = cube_ts_pixels.sum().item()
+            # NEW: Use a vegetation-relative denominator: every vegetated
+            # pixel can contribute at each target timestep.
+            total_cube_pixels = int(cube_ts_pixels.sum().item())
+            eligible_veg_pixels = int(eligible_veg_cube.sum().item())
+            possible_target_pixel_times = t_fut * eligible_veg_pixels
+            valid_target_coverage = (
+                total_cube_pixels / possible_target_pixel_times
+                if possible_target_pixel_times > 0
+                else 0.0
+            )
+            r2_nnse_exclusion_reasons = []
+            if not reconstruction_complete:
+                r2_nnse_exclusion_reasons.append("incomplete_reconstruction")
+            if eligible_veg_pixels == 0:
+                r2_nnse_exclusion_reasons.append("no_eligible_vegetation")
+            if total_cube_pixels == 0:
+                r2_nnse_exclusion_reasons.append("no_valid_target_pixel_times")
+            if 0 < total_cube_pixels < min_valid_target_count:
+                r2_nnse_exclusion_reasons.append("insufficient_valid_target_count")
             if (
-                total_cube_pixels > 0
-            ):  # Could add min_pixel_threshold here to filter out cubes with too little valid data
+                possible_target_pixel_times > 0
+                and valid_target_coverage < min_valid_target_coverage
+            ):
+                r2_nnse_exclusion_reasons.append("insufficient_valid_target_coverage")
+
+            if total_cube_pixels > 0:
                 # Model Metrics
                 cube_mse = cube_ts_sq_err.sum().item() / total_cube_pixels
                 cube_mae = cube_ts_abs_err.sum().item() / total_cube_pixels
@@ -604,29 +645,41 @@ class ConvLSTM_Model(pl.LightningModule):
 
                 cube_skill = 1 - (cube_mse / (cube_mse_base + 1e-8))
 
-                # Variance metrics
-                # Variance/R2 per Cube
-                # --- R² CALCULATION VIA VARIANCE DECOMPOSITION ---
-                # R² = 1 - (SS_res / SS_tot)
-                #
-                # Since we cannot store all pixels, we use the "Sum of Squares Identity":
-                # SS_tot = Σ(y_true - mean_y_true)²  =>  Σ(y_true²) - ( (Σ y_true)² / n )
-                #
-                # 1. sq_err: Residual Sum of Squares (SS_res)  (Σ (y_pred - y_true)²)
-                # 2. y_true_sq_sum:   Sum of squared raw values (Σ y_true²)
-                # 3. y_true_sum:      Sum of raw values (Σ y_true)
-                # 4. pixels:          Total pixel count (n)
-                cube_sst = cube_ts_y_t_sq.sum().item() - (
-                    (cube_ts_y_t.sum().item() ** 2) / total_cube_pixels
-                )
-                cube_r2 = 1 - (cube_ts_sq_err.sum().item() / (cube_sst + 1e-8))
-                cube_r2_base = 1 - (
-                    cube_ts_sq_err_base.sum().item() / (cube_sst + 1e-8)
-                )
-                # Formula from Pellicer-Valero et al. (2025) to convert R² to NNSE: NNSE = 1 / (2 - R²)
-                cube_nnse = 1 / (2 - cube_r2)
-                cube_nnse_base = 1 / (2 - cube_r2_base)
+                # Variance--based cube metrics (NNSE and R2) use the direct,
+                # centred definition SST = Σ(y - mean(y))².
+                # Calculate SST from centred targets in float64.
+                # The previous sum(y^2) - sum(y)^2 / n identity is vulnerable
+                # to cancellation for nearly constant kNDVI targets.
+                valid_true = true_cube[valid_mask].to(torch.float64)
+                valid_pred = pred_cube[valid_mask].to(torch.float64)
+                valid_base = base_cube[valid_mask].to(torch.float64)
+                cube_mean_true = valid_true.mean()
+                cube_sst = torch.sum((valid_true - cube_mean_true) ** 2).item()
+                cube_variance = cube_sst / total_cube_pixels
 
+                if cube_variance < min_target_variance:
+                    r2_nnse_exclusion_reasons.append("target_variance_below_minimum")
+                # Formula from Pellicer-Valero et al. (2025) to convert R² to NNSE: NNSE = 1 / (2 - R²)
+                # R2/NNSE are undefined, rather than epsilon-stabilised,
+                # when coverage, sample count, reconstruction, or variance fail.
+                if r2_nnse_exclusion_reasons:
+                    cube_r2 = float("nan")
+                    cube_r2_base = float("nan")
+                    cube_nnse = float("nan")
+                    cube_nnse_base = float("nan")
+                else:
+                    cube_sse = torch.sum((valid_pred - valid_true) ** 2).item()
+                    cube_sse_base = torch.sum(
+                        (valid_base - valid_true) ** 2
+                    ).item()
+                    cube_r2 = 1.0 - (cube_sse / cube_sst)
+                    cube_r2_base = 1.0 - (cube_sse_base / cube_sst)
+                    cube_nnse = 1.0 / (2.0 - cube_r2)
+                    cube_nnse_base = 1.0 / (2.0 - cube_r2_base)
+
+                # The audit explicitly records why a cube is or is
+                # not eligible for the Macro R2/NNSE aggregate.
+                r2_nnse_eligible = len(r2_nnse_exclusion_reasons) == 0
                 all_cube_metrics.append(
                     {
                         "id": cube_id,
@@ -641,14 +694,62 @@ class ConvLSTM_Model(pl.LightningModule):
                         "r2_base": cube_r2_base,
                         "nnse_base": cube_nnse_base,
                         "cube_skill": cube_skill,
+                        "n_valid_target_pixel_times": total_cube_pixels,
+                        "n_eligible_vegetation_pixels": eligible_veg_pixels,
+                        "valid_target_coverage": valid_target_coverage,
+                        "target_sst": cube_sst,
+                        "target_variance": cube_variance,
+                        "reconstruction_complete": reconstruction_complete,
+                        "r2_nnse_eligible": r2_nnse_eligible,
+                        "r2_nnse_exclusion_reason": ";".join(
+                            r2_nnse_exclusion_reasons
+                        ),
                     }
                 )
+
+            else:
+                # Persist fully invalid cubes in the audit CSV rather
+                all_cube_metrics.append(
+                    {
+                        "id": cube_id,
+                        "mse": float("nan"),
+                        "mae": float("nan"),
+                        "bias": float("nan"),
+                        "r2": float("nan"),
+                        "nnse": float("nan"),
+                        "mse_base": float("nan"),
+                        "mae_base": float("nan"),
+                        "bias_base": float("nan"),
+                        "r2_base": float("nan"),
+                        "nnse_base": float("nan"),
+                        "cube_skill": float("nan"),
+                        "n_valid_target_pixel_times": total_cube_pixels,
+                        "n_eligible_vegetation_pixels": eligible_veg_pixels,
+                        "valid_target_coverage": valid_target_coverage,
+                        "target_sst": float("nan"),
+                        "target_variance": float("nan"),
+                        "reconstruction_complete": reconstruction_complete,
+                        "r2_nnse_eligible": False,
+                        "r2_nnse_exclusion_reason": ";".join(
+                            r2_nnse_exclusion_reasons
+                        ),
+                    }
+                )
+
+            # MAE/MSE/Bias are defined without a target-variance
+            # denominator. R2/NNSE use the stricter eligibility conditions.
+            cube_metric = all_cube_metrics[-1]
+            if reconstruction_complete and total_cube_pixels > 0:
+                macro_error_cube_metrics.append(cube_metric)
+            if cube_metric["r2_nnse_eligible"]:
+                macro_r2_nnse_cube_metrics.append(cube_metric)
 
         # --- 4. Final Aggregation and Logging ---
         metrics_to_log = {}
 
         # Log Timestep-wise Micro metrics across all cubes
         # Every pixel has the same weight, so if a cube has only few pixels in timestep 3, it will not bias the overall metric for that timestep.
+        # Log metrics for each timestep, so it can be seen how the error evolves over time T. (Only for final evaluation)
         log_ts = self.cfg["training"]["validation"].get("log_timestep_metrics", False)
         if log_ts:
             for t in range(t_fut):
@@ -715,40 +816,60 @@ class ConvLSTM_Model(pl.LightningModule):
         # Here each cube has the same weight (independend of how many valid pixels it has), so cubes with few pixels are not dominated by cubes with many pixels,
         # Answers the question: "How well perfomrs the model on an average region on earth"
         # Tropical regions with many invalid pixels could be underrepresented in the micro metrics (as the have fewer valid pixels than dessert areas)
-        if all_cube_metrics:
-            n_c = len(all_cube_metrics)
+        # Error metrics have no target-variance denominator and retain all complete cubes with valid targets.
+        if macro_error_cube_metrics:
+            n_c = len(macro_error_cube_metrics)
             metrics_to_log["val/grand_mean_macro/MSE"] = (
-                sum(c["mse"] for c in all_cube_metrics) / n_c
+                sum(c["mse"] for c in macro_error_cube_metrics) / n_c
             )
             metrics_to_log["val/grand_mean_macro/MSE_base"] = (
-                sum(c["mse_base"] for c in all_cube_metrics) / n_c
+                sum(c["mse_base"] for c in macro_error_cube_metrics) / n_c
             )
             metrics_to_log["val/grand_mean_macro/MAE"] = (
-                sum(c["mae"] for c in all_cube_metrics) / n_c
+                sum(c["mae"] for c in macro_error_cube_metrics) / n_c
             )
             metrics_to_log["val/grand_mean_macro/MAE_base"] = (
-                sum(c["mae_base"] for c in all_cube_metrics) / n_c
+                sum(c["mae_base"] for c in macro_error_cube_metrics) / n_c
             )
             metrics_to_log["val/grand_mean_macro/Bias"] = (
-                sum(c["bias"] for c in all_cube_metrics) / n_c
+                sum(c["bias"] for c in macro_error_cube_metrics) / n_c
             )
             metrics_to_log["val/grand_mean_macro/Bias_base"] = (
-                sum(c["bias_base"] for c in all_cube_metrics) / n_c
-            )
-            metrics_to_log["val/grand_mean_macro/R2"] = (
-                sum(c["r2"] for c in all_cube_metrics) / n_c
-            )
-            metrics_to_log["val/grand_mean_macro/R2_base"] = (
-                sum(c["r2_base"] for c in all_cube_metrics) / n_c
-            )
-            metrics_to_log["val/grand_mean_macro/NNSE"] = (
-                sum(c["nnse"] for c in all_cube_metrics) / n_c
-            )
-            metrics_to_log["val/grand_mean_macro/NNSE_base"] = (
-                sum(c["nnse_base"] for c in all_cube_metrics) / n_c
+                sum(c["bias_base"] for c in macro_error_cube_metrics) / n_c
             )
             metrics_to_log["val/grand_mean_macro/Skill_Score"] = (
-                sum(c["cube_skill"] for c in all_cube_metrics) / n_c
+                sum(c["cube_skill"] for c in macro_error_cube_metrics) / n_c
+            )
+
+        # Only cubes with sufficient valid vegetated targets and
+        # non-negligible target variance contribute to Macro R2/NNSE.
+        n_r2_nnse_eligible = len(macro_r2_nnse_cube_metrics)
+        n_r2_nnse_excluded = len(all_cube_metrics) - n_r2_nnse_eligible
+        metrics_to_log["val/grand_mean_macro/R2_NNSE_eligible_cubes"] = (
+            n_r2_nnse_eligible
+        )
+        metrics_to_log["val/grand_mean_macro/R2_NNSE_excluded_cubes"] = (
+            n_r2_nnse_excluded
+        )
+
+        if macro_r2_nnse_cube_metrics:
+            metrics_to_log["val/grand_mean_macro/R2"] = sum(
+                c["r2"] for c in macro_r2_nnse_cube_metrics
+            ) / n_r2_nnse_eligible
+            metrics_to_log["val/grand_mean_macro/R2_base"] = sum(
+                c["r2_base"] for c in macro_r2_nnse_cube_metrics
+            ) / n_r2_nnse_eligible
+            metrics_to_log["val/grand_mean_macro/NNSE"] = sum(
+                c["nnse"] for c in macro_r2_nnse_cube_metrics
+            ) / n_r2_nnse_eligible
+            metrics_to_log["val/grand_mean_macro/NNSE_base"] = sum(
+                c["nnse_base"] for c in macro_r2_nnse_cube_metrics
+            ) / n_r2_nnse_eligible
+        elif not is_sanity:
+            # Raise an error if selection metric is invalid
+            raise RuntimeError(
+                "No cube is eligible for Macro R2/NNSE. Review the validation "
+                "thresholds or the target masks before training."
             )
 
         self.log_dict(metrics_to_log, sync_dist=True)
@@ -926,9 +1047,7 @@ class ConvLSTM_Model(pl.LightningModule):
                 print("WARNING: Could not capture hidden states.")
                 return None
 
-            # hidden shape ist (B, C, H, W)
             total_channels = hidden.shape[1]
-            # Wir wollen genau 8 Plots (für dein 2x4 Layout)
             num_to_plot = min(8, total_channels)
 
             fig, axes = plt.subplots(2, 4, figsize=(15, 8))

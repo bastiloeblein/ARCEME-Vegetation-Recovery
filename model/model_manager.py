@@ -447,7 +447,9 @@ class ARCEMEPipeline:
             model.fold_idx = fold_idx
 
             wandb_logger = WandbLogger(
-                project="ARCEME_kNDVI_Prediction",
+                project=self.cfg.get("wandb", {}).get(
+                    "project", "ARCEME_kNDVI_Prediction"
+                ),  # CHANGED: project is configured centrally in config.yaml
                 name=f"{self.cfg['experiment_name']}_fold_{fold_idx}",
                 group=self.cfg["experiment_name"],
                 # model_type  =self.cfg["model"]["model_type"],

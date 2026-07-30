@@ -1,4 +1,6 @@
 experiment_name: "Ultimately_Final_Model_SGEDConvLSTM_RGBI"
+wandb:
+  project: "ARCEME-Vegetation-Recovery-Final" 
 data:
   train_data_dir: "/net/projects/arceme/vegetation_recovery_prediction/data/final_new/train" #"/scratch/sloeblein/postprocessed" #/net/projects/arceme/vegetation_recovery_prediction/postprocessed"
   train_test_split: "data_processing/data/train_test_split.csv"
@@ -76,12 +78,13 @@ training:
     gamma: 0 # 2      # Additionnal spatial loss weight (spaital gradient loss)
   scaling_factor: 1 #10.0
   validation:
-    selection_metric: "mse"
     monitor:
       # split: "val"
       metric: "val/grand_mean_macro/NNSE" # "gm_nnse"
     monitor_mode: "max" #"max"  # "max" for nnse, "min" for loss
-    min_pixel_threshold: 0.15 #  Minimum pixel threshold, so a cube is consider for validation metric calculation
+    min_valid_target_coverage: 0.15 # valid target pixel-times / all possible vegetated target pixel-times
+    min_valid_target_count: 1000 # avoids a cube score being based on very few observations
+    min_target_variance: 0.000001 # R2/NNSE are undefined for an effectively constant target
     log_timestep_metrics: False # Whether to log timestep-wise metrics across all cubes during validation/testing
 model:
   model_type: "SGEDConvLSTM"

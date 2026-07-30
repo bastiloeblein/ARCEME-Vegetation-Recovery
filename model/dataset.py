@@ -834,12 +834,7 @@ class ARCEME_Dataset(Dataset):
             path,
         )
 
-        # Spatial denominator for cube-wise validation coverage.  This is kept
-        # separate from target_mask: target_mask is zero for both clouds and
-        # non-vegetated locations, whereas coverage must be relative to the
-        # eligible vegetation area only.  is_veg is static in the processed
-        # cubes; any() also makes the intent safe if a legacy cube repeats it
-        # over the target time dimension.
+        # Spatial denominator for cube-wise validation coverage. 
         eligible_veg = is_veg_target.bool().any(dim=0)
 
         # Training samples must carry supervision. Validation/test tiles remain
