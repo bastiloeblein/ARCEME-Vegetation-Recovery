@@ -402,7 +402,7 @@ class ARCEMEPipeline:
         return None
 
     def get_best_overall_checkpoint(self):
-        """Scans the run_dir to find the absolutely best checkpoint across all completed folds.""".
+        """Scans the run_dir to find the absolutely best checkpoint across all completed folds."""
         # If final refit: get the final checkpoint after pre-specified number of epochs
         final_refit_summary_path = os.path.join(
             self.run_dir, "final_refit_summary.json"
