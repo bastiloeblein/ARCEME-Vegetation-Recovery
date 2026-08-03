@@ -346,7 +346,7 @@ class ConvLSTM_Model(pl.LightningModule):
             "save_tensors", False
         )
 
-        # Get eligibility rules for the variance-based cube metrics NNSE and R2. 
+        # Get eligibility rules for the variance-based cube metrics NNSE and R2.
         validation_cfg = self.cfg["training"]["validation"]
         min_valid_target_coverage = float(
             validation_cfg.get(
@@ -354,12 +354,8 @@ class ConvLSTM_Model(pl.LightningModule):
                 validation_cfg.get("min_pixel_threshold", 0.0),
             )
         )
-        min_valid_target_count = int(
-            validation_cfg.get("min_valid_target_count", 1)
-        )
-        min_target_variance = float(
-            validation_cfg.get("min_target_variance", 0.0)
-        )
+        min_valid_target_count = int(validation_cfg.get("min_valid_target_count", 1))
+        min_target_variance = float(validation_cfg.get("min_target_variance", 0.0))
         if not 0.0 <= min_valid_target_coverage <= 1.0:
             raise ValueError("min_valid_target_coverage must be in [0, 1].")
         if min_valid_target_count < 1 or min_target_variance < 0.0:
@@ -669,9 +665,7 @@ class ConvLSTM_Model(pl.LightningModule):
                     cube_nnse_base = float("nan")
                 else:
                     cube_sse = torch.sum((valid_pred - valid_true) ** 2).item()
-                    cube_sse_base = torch.sum(
-                        (valid_base - valid_true) ** 2
-                    ).item()
+                    cube_sse_base = torch.sum((valid_base - valid_true) ** 2).item()
                     cube_r2 = 1.0 - (cube_sse / cube_sst)
                     cube_r2_base = 1.0 - (cube_sse_base / cube_sst)
                     cube_nnse = 1.0 / (2.0 - cube_r2)
@@ -701,9 +695,7 @@ class ConvLSTM_Model(pl.LightningModule):
                         "target_variance": cube_variance,
                         "reconstruction_complete": reconstruction_complete,
                         "r2_nnse_eligible": r2_nnse_eligible,
-                        "r2_nnse_exclusion_reason": ";".join(
-                            r2_nnse_exclusion_reasons
-                        ),
+                        "r2_nnse_exclusion_reason": ";".join(r2_nnse_exclusion_reasons),
                     }
                 )
 
@@ -730,9 +722,7 @@ class ConvLSTM_Model(pl.LightningModule):
                         "target_variance": float("nan"),
                         "reconstruction_complete": reconstruction_complete,
                         "r2_nnse_eligible": False,
-                        "r2_nnse_exclusion_reason": ";".join(
-                            r2_nnse_exclusion_reasons
-                        ),
+                        "r2_nnse_exclusion_reason": ";".join(r2_nnse_exclusion_reasons),
                     }
                 )
 
@@ -853,18 +843,20 @@ class ConvLSTM_Model(pl.LightningModule):
         )
 
         if macro_r2_nnse_cube_metrics:
-            metrics_to_log["val/grand_mean_macro/R2"] = sum(
-                c["r2"] for c in macro_r2_nnse_cube_metrics
-            ) / n_r2_nnse_eligible
-            metrics_to_log["val/grand_mean_macro/R2_base"] = sum(
-                c["r2_base"] for c in macro_r2_nnse_cube_metrics
-            ) / n_r2_nnse_eligible
-            metrics_to_log["val/grand_mean_macro/NNSE"] = sum(
-                c["nnse"] for c in macro_r2_nnse_cube_metrics
-            ) / n_r2_nnse_eligible
-            metrics_to_log["val/grand_mean_macro/NNSE_base"] = sum(
-                c["nnse_base"] for c in macro_r2_nnse_cube_metrics
-            ) / n_r2_nnse_eligible
+            metrics_to_log["val/grand_mean_macro/R2"] = (
+                sum(c["r2"] for c in macro_r2_nnse_cube_metrics) / n_r2_nnse_eligible
+            )
+            metrics_to_log["val/grand_mean_macro/R2_base"] = (
+                sum(c["r2_base"] for c in macro_r2_nnse_cube_metrics)
+                / n_r2_nnse_eligible
+            )
+            metrics_to_log["val/grand_mean_macro/NNSE"] = (
+                sum(c["nnse"] for c in macro_r2_nnse_cube_metrics) / n_r2_nnse_eligible
+            )
+            metrics_to_log["val/grand_mean_macro/NNSE_base"] = (
+                sum(c["nnse_base"] for c in macro_r2_nnse_cube_metrics)
+                / n_r2_nnse_eligible
+            )
         elif not is_sanity:
             # Raise an error if selection metric is invalid
             raise RuntimeError(
@@ -976,6 +968,16 @@ class ConvLSTM_Model(pl.LightningModule):
 
                 # Prevent memory leaks
                 plt.close(fig)
+
+    def lr_scheduler_step(self, scheduler, metric):
+        warmup_cfg = self.cfg["training"]["optimizer"].get("warmup", {})
+
+        warmup_epochs = (
+            warmup_cfg.get("epochs", 0) if warmup_cfg.get("enabled", False) else 0
+        )
+
+        if self.current_epoch >= warmup_epochs:
+            scheduler.step(metric)
 
     def configure_optimizers(self):
         """

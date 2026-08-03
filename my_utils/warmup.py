@@ -47,6 +47,8 @@ class ConfigWarmupCallback(pl.Callback):
 
         # At first normal epoch, print message about warmup end
         elif epoch == self.warmup_epochs:
+            for param_group in trainer.optimizers[0].param_groups:
+                param_group["lr"] = self.target_lr
             print(
                 f"\n🚀 Warmup ended! Starting normal Training with target LR {self.target_lr:.6f}."
             )

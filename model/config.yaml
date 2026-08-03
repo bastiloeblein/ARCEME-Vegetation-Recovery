@@ -1,6 +1,6 @@
-experiment_name: "Ultimately_Final_Model_SGEDConvLSTM_RGBI"
+experiment_name: "CV_Training_SGEDConvLSTM_Indices"
 wandb:
-  project: "ARCEME-Vegetation-Recovery-Final" 
+  project: "ARCEME-Vegetation-Dynamics-Prediction-Final"
 data:
   train_data_dir: "/net/projects/arceme/vegetation_recovery_prediction/data/final_new/train" #"/scratch/sloeblein/postprocessed" #/net/projects/arceme/vegetation_recovery_prediction/postprocessed"
   train_test_split: "data_processing/data/train_test_split.csv"
@@ -22,13 +22,13 @@ data:
   variables:
     s2:
       - "kNDVI"
-      - "B02"
-      - "B03"
-      - "B04"
-      - "B8A"
-      # - "IRECI"
-      # - "NDMI"
-      # - "NIRv"  # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
+      # - "B02"
+      # - "B03"
+      # - "B04"
+      # - "B8A"
+      - "IRECI"
+      - "NDMI"
+      - "NIRv"  # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
     s1:
       - "vv"
       - "vh"
@@ -46,27 +46,33 @@ data:
     static:
       - "COP_DEM" # Static vars (ESA_LC not included because one hot encoding is done in dataloader)
   data_loader:
-    num_workers: 12
+    num_workers: 10
 training:
   seed: 777 # 5 for testing # 777 for training
   optimizer:
     name: "adamW"
     start_learn_rate: 0.0001
+
     warmup:
       enabled: true
       epochs: 5
+
     lr_factor: 0.50
     lr_threshold: 0.0001
     scheduler_patience: 5
     min_lr: 0.000001
+
     patience: 20
+
   gradient_clipping:
     enabled: false
     value: 1.0
     algorithm: "norm"
+
   batch_size: 8
   accumulate_grad_batches: 1
-  max_epochs: 200
+  max_epochs: 100
+
   accelerator: "gpu"
   devices: 1
   precision: "16-mixed"  # 32
