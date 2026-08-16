@@ -1,4 +1,4 @@
-experiment_name: "CV_Training_SGEDConvLSTM_Indices"
+experiment_name: "CV_Training_SGConvLSTM_RGBI"
 wandb:
   project: "ARCEME-Vegetation-Dynamics-Prediction-Final"
 data:
@@ -22,13 +22,13 @@ data:
   variables:
     s2:
       - "kNDVI"
-      # - "B02"
-      # - "B03"
-      # - "B04"
-      # - "B8A"
-      - "IRECI"
-      - "NDMI"
-      - "NIRv"  # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
+      - "B02"
+      - "B03"
+      - "B04"
+      - "B8A"
+      # - "IRECI"
+      # - "NDMI"
+      # - "NIRv"  # ["kNDVI", "CIRE", "IRECI", "NDWI", "NDMI", "NIRv"]   # alle
     s1:
       - "vv"
       - "vh"
@@ -69,8 +69,8 @@ training:
     value: 1.0
     algorithm: "norm"
 
-  batch_size: 8
-  accumulate_grad_batches: 1
+  batch_size: 4
+  accumulate_grad_batches: 2
   max_epochs: 100
 
   accelerator: "gpu"
@@ -97,7 +97,7 @@ training:
     min_target_variance: 0.000001 # R2/NNSE are undefined for an effectively constant target
     log_timestep_metrics: False # Whether to log timestep-wise metrics across all cubes during validation/testing
 model:
-  model_type: "SGEDConvLSTM"
+  model_type: "SGConvLSTM"
   checkpoint_path: None
   output_channels: 1      # We want to predict 1 channel (kNDVI)
   hidden_channels:
