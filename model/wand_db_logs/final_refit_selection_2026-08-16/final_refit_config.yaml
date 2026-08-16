@@ -1,0 +1,104 @@
+cross_validation:
+  enabled: false
+  k_folds: 3
+  type: llto
+data:
+  context_length: 30
+  data_loader:
+    num_workers: 10
+  patch_size: 128
+  quality_check:
+    ctx_min_valid_overall: 0.1
+    ctx_min_valid_ratio: 0.05
+    ctx_required_fraction: 0.25
+    cube_resample_attempts: 4
+    patch_max_retries: 15
+    tgt_min_timesteps: 1
+    tgt_min_valid_ratio: 0.05
+  target_length: 6
+  test_data_dir: /net/projects/arceme/vegetation_recovery_prediction/data/final_new/test
+  train_data_dir: /net/projects/arceme/vegetation_recovery_prediction/data/final_new/train
+  train_test_split: data_processing/data/train_test_split.csv
+  variables:
+    era5:
+    - t2m_mean
+    - t2m_min
+    - t2m_max
+    - tp_rollingmax_mean
+    - pei_30_mean
+    - pei_90_mean
+    s1:
+    - vv
+    - vh
+    s2:
+    - kNDVI
+    - B02
+    - B03
+    - B04
+    - B8A
+    static:
+    - COP_DEM
+experiment_name: FinalRefit_SGEDConvLSTM_RGBI_kNDVI
+model:
+  baseline: last_frame
+  checkpoint_path: null
+  dilation_rate: 1
+  dropout_prob: 0.3
+  hidden_channels:
+  - 96
+  - 96
+  - 96
+  kernel: 5
+  layer_norm: false
+  memory_kernel: 5
+  model_type: SGEDConvLSTM
+  n_layers: 3
+  output_channels: 1
+  peephole: false
+testing:
+  save_metrics: true
+  save_tensors: true
+training:
+  accelerator: gpu
+  accumulate_grad_batches: 1
+  batch_size: 8
+  devices: 1
+  final_refit:
+    enabled: true
+    epochs: 23
+    source_cv_run: /net/home/sloeblein/ARCEME-Vegetation-Recovery/model/wand_db_logs/CV_Training_SGEDConvLSTM_RGBI_2026-08-03_20-20-39
+  gradient_clipping:
+    algorithm: norm
+    enabled: false
+    value: 1.0
+  max_epochs: 23
+  optimizer:
+    lr_factor: 0.5
+    lr_threshold: 0.0001
+    min_lr: 1.0e-06
+    name: adamW
+    patience: 20
+    scheduler_patience: 5
+    start_learn_rate: 0.0001
+    warmup:
+      enabled: true
+      epochs: 5
+  precision: 16-mixed
+  scaling_factor: 1
+  seed: 2026
+  training_loss:
+    alpha: 1
+    beta: 0
+    gamma: 0
+    loss_function: l1
+  use_augmentation: true
+  validation:
+    log_timestep_metrics: false
+    min_target_variance: 1.0e-06
+    min_valid_target_count: 1000
+    min_valid_target_coverage: 0.15
+    monitor:
+      metric: val/grand_mean_macro/NNSE
+    monitor_mode: max
+wandb:
+  project: ARCEME-Vegetation-Dynamics-Prediction-Final
