@@ -46,6 +46,17 @@ def main():
         default=None,
         help="Path to a txt or csv file containing absolute paths to .zarr files (one per line).",
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Optional separate directory for tensors, metrics and plots.",
+    )
+    parser.add_argument(
+        "--no_plots",
+        action="store_true",
+        help="Skip full-cube qualitative plots (recommended for OOF export).",
+    )
 
     args = parser.parse_args()
 
@@ -100,7 +111,12 @@ def main():
     # Start Evaluation
     print(f"Starting Evaluation using checkpoint: {ckpt_to_load}")
     # If custom_test_files is None, looks automatically in cfg["data"]["test_data_dir"]
-    results = pipeline.evaluate(ckpt_path=ckpt_to_load, test_files=custom_test_files)
+    results = pipeline.evaluate(
+        ckpt_path=ckpt_to_load,
+        test_files=custom_test_files,
+        output_dir=args.output_dir,
+        plot_samples=not args.no_plots,
+    )
 
     print("\n✅ Evaluation Finished!")
     print(results)

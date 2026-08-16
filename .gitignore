@@ -34,8 +34,13 @@ data_processing/data/WorldSeasons/
 data_processing/data/consolidated_s2_lc_analysis.csv
 model/tb_logs
 model/new_logs
+model/wand_db_logs/
+model/test_logs/
 plots/
 notebooks/02_Model_Specific/evaluation_plots/
+
+# Local editor history (not project source or a reproducible experiment artefact)
+.history/
 
 # OS spezifisch
 .DS_Store

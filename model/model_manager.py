@@ -455,7 +455,7 @@ class ARCEMEPipeline:
     def run_cv(self, start_fold=0, resume_from_type="last"):
         """Executes the CV loop. Handles resuming automatically."""
         if self.is_final_refit:
-            return self.run_final_refit()
+            return self.run_final_refit(resume_from_type=resume_from_type)
 
         # Get valid paths and cv splits
         all_folds = self.prepare_data()
@@ -641,7 +641,7 @@ class ARCEMEPipeline:
         match = re.search(r"epoch=(\d+)", checkpoint_path)
         return int(match.group(1)) if match else None
 
-    def run_final_refit(self):
+    def run_final_refit(self, resume_from_type="last"):
         """Fit one selected configuration on every eligible training cube.
 
         Model selection must already be complete from CV. Consequently this
@@ -658,6 +658,25 @@ class ARCEMEPipeline:
                 "from the CV summary's recommended_final_refit_epochs before "
                 "starting the final refit."
             )
+
+        final_summary_path = os.path.join(self.run_dir, "final_refit_summary.json")
+        if os.path.exists(final_summary_path):
+            raise RuntimeError(
+                "This final-refit run is already complete. Start a new run for a "
+                "new refit, or evaluate its final checkpoint instead."
+            )
+
+        # A final refit has no validation score and therefore only a
+        # ``last.ckpt``.  Resuming it must use that checkpoint explicitly.
+        if resume_from_type != "last":
+            raise ValueError(
+                "Final refit can only resume from its last checkpoint; use "
+                "--resume_type last."
+            )
+        final_ckpt_dir = os.path.join(self.run_dir, "final_refit", "checkpoints")
+        resume_ckpt = os.path.join(final_ckpt_dir, "last.ckpt")
+        if not os.path.exists(resume_ckpt):
+            resume_ckpt = None
 
         train_files = self.prepare_data()
         if not train_files:
@@ -690,7 +709,6 @@ class ARCEMEPipeline:
             exclusion_artifact.add_file(self.exclude_csv_path)
             wandb_logger.experiment.log_artifact(exclusion_artifact)
 
-        final_ckpt_dir = os.path.join(self.run_dir, "final_refit", "checkpoints")
         # There is no best validation score to log (as there is no validation data), so save the last epoch only
         final_checkpoint_callback = ModelCheckpoint(
             dirpath=final_ckpt_dir,
@@ -733,7 +751,9 @@ class ARCEMEPipeline:
             self.v_cfg["static"],
             expected_input_channels=self.cfg["model"]["input_channels"],
         )
-        trainer.fit(model, train_loader)
+        if resume_ckpt:
+            print(f"♻️ Resuming final refit from: {resume_ckpt}")
+        trainer.fit(model, train_loader, ckpt_path=resume_ckpt)
 
         final_checkpoint = final_checkpoint_callback.last_model_path
         if not final_checkpoint or not os.path.exists(final_checkpoint):
@@ -745,6 +765,7 @@ class ARCEMEPipeline:
             "epochs": epochs,
             "seed": self.global_seed,
             "source_cv_run": self.final_refit_cfg.get("source_cv_run"),
+            "resumed_from_checkpoint": resume_ckpt,
             "early_stopping": False,
             "validation_used": False,
         }
@@ -760,16 +781,33 @@ class ARCEMEPipeline:
         wandb.finish()
         return final_summary
 
-    def evaluate(self, ckpt_path, test_files=None):
-        """Evaluates a loaded model on test data."""
+    def evaluate(
+        self,
+        ckpt_path,
+        test_files=None,
+        output_dir=None,
+        plot_samples=True,
+    ):
+        """Evaluate a checkpoint and optionally redirect saved artefacts.
+
+        A separate ``output_dir`` prevents out-of-fold exports from
+        overwriting one another. ``plot_samples=False`` avoids loading
+        validation cubes from the configured holdout directory.
+        """
         print(f"\n🔍 Evaluating model from: {ckpt_path}")
         if test_files is None:
             test_files = self.prepare_data()
 
+        evaluation_output_dir = os.path.abspath(output_dir or self.run_dir)
+        os.makedirs(evaluation_output_dir, exist_ok=True)
+        # The Lightning module reads the artefact destination from cfg in
+        # on_validation_epoch_end.
+        self.cfg["model"]["run_dir"] = evaluation_output_dir
+
         model = ConvLSTM_Model.load_from_checkpoint(ckpt_path, cfg=self.cfg)
         model.eval()
 
-        model.is_testing_mode = True
+        model.is_testing_mode = bool(plot_samples)
 
         self.cfg["testing"]["save_tensors"] = True
         self.cfg["testing"]["save_metrics"] = True
