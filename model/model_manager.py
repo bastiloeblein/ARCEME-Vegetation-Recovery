@@ -788,20 +788,14 @@ class ARCEMEPipeline:
         output_dir=None,
         plot_samples=True,
     ):
-        """Evaluate a checkpoint and optionally redirect saved artefacts.
-
-        A separate ``output_dir`` prevents out-of-fold exports from
-        overwriting one another. ``plot_samples=False`` avoids loading
-        validation cubes from the configured holdout directory.
-        """
+        """Evaluate one checkpoint and write outputs to the selected directory."""
         print(f"\n🔍 Evaluating model from: {ckpt_path}")
         if test_files is None:
             test_files = self.prepare_data()
 
         evaluation_output_dir = os.path.abspath(output_dir or self.run_dir)
         os.makedirs(evaluation_output_dir, exist_ok=True)
-        # The Lightning module reads the artefact destination from cfg in
-        # on_validation_epoch_end.
+        # The Lightning module reads the output directory from the config.
         self.cfg["model"]["run_dir"] = evaluation_output_dir
 
         model = ConvLSTM_Model.load_from_checkpoint(ckpt_path, cfg=self.cfg)
