@@ -1,0 +1,4 @@
+fold,n_train_cubes,n_validation_cubes,n_train_climate_classes,n_validation_climate_classes,validation_climate_classes
+0,91,55,12,7,Am; BSh; Cfb; Csa; Csb; Dfc; ET
+1,98,48,13,6,Af; BSk; BWh; Cfa; Dfb; Dwc
+2,103,43,13,6,Aw; BWk; Cwa; Cwb; Dwa; Dwb

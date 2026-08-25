@@ -1,0 +1,4 @@
+fold,n_train_cubes,n_validation_cubes,minimum_train_validation_distance_km,minimum_distance_validation_cube,minimum_distance_train_cube,median_nearest_train_distance_km,mean_nearest_train_distance_km,maximum_nearest_train_distance_km
+0,91,55,101.178,2018-0248-UKR,2020-0286-ROU,567.487,701.811,2357.228
+1,98,48,82.072,2022-0501-YEM,2022-0456-YEM,415.203,599.544,5319.583
+2,103,43,82.072,2022-0456-YEM,2022-0501-YEM,434.139,591.210,1616.723
