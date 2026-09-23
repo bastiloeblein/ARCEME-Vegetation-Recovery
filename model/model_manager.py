@@ -133,17 +133,27 @@ class ARCEMEPipeline:
         """
         Calculate the number of input and future channels based on the variables in the config.
         """
+        include_landcover = bool(self.cfg["data"].get("include_landcover", True))
+        landcover_channels = 12 if include_landcover else 0
+        auxiliary_s2_channels = max(len(self.v_cfg["s2"]) - 1, 0)
+        num_mask_channels = (
+            1  # kNDVI mask
+            + int(len(self.v_cfg["s2"]) > 1)
+            + int(len(self.v_cfg["s1"]) > 0)
+        )
         # Inputs are: S2 + S1 + ERA5 + 3 Mask Channels (S1, S2, additional unique kNDVI mask)+ 12 One-Hot Encoded LC Channels + Static Variables
         total_in = (
             len(self.v_cfg["s2"])
             + len(self.v_cfg["s1"])
             + len(self.v_cfg["era5"])
-            + (3 if len(self.v_cfg["s1"]) > 0 else 2)  # Masks (S1, kNDVI, S2 rest)
-            + 12
+            + num_mask_channels
+            + landcover_channels
             + len(self.v_cfg["static"])
         )
         # Guided input gets: placeholder_kNDVI Channel + Future ERA5 + 12 One-Hot Encoded LC Channels + Static Variables
-        total_fut = 1 + len(self.v_cfg["era5"]) + 12 + len(self.v_cfg["static"])
+        total_fut = (
+            1 + len(self.v_cfg["era5"]) + landcover_channels + len(self.v_cfg["static"])
+        )
 
         self.cfg["model"]["input_channels"] = total_in
         self.cfg["model"]["future_channels"] = total_fut
@@ -219,7 +229,7 @@ class ARCEMEPipeline:
         )
 
         if self.is_final_refit:
-            # Store complete, quality-filtered training set used for the final training run. 
+            # Store complete, quality-filtered training set used for the final training run.
             final_refit_manifest = {
                 "train_files": [str(path) for path in valid_zarrs_paths],
                 "num_train": len(valid_zarrs_paths),
@@ -491,7 +501,7 @@ class ARCEMEPipeline:
             wandb_logger = WandbLogger(
                 project=self.cfg.get("wandb", {}).get(
                     "project", "ARCEME_kNDVI_Prediction"
-                ), 
+                ),
                 name=f"{self.cfg['experiment_name']}_fold_{fold_idx}",
                 group=self.cfg["experiment_name"],
                 # model_type  =self.cfg["model"]["model_type"],
@@ -571,7 +581,14 @@ class ARCEMEPipeline:
                 enable_model_summary=True,  # zeigt die architektur und die anzahl der parameter an, könnte hilfreich sein
             )
 
-            print_channel_info(v_cfg["s2"], v_cfg["s1"], v_cfg["era5"], v_cfg["static"], expected_input_channels=self.cfg["model"]["input_channels"],)
+            print_channel_info(
+                v_cfg["s2"],
+                v_cfg["s1"],
+                v_cfg["era5"],
+                v_cfg["static"],
+                expected_input_channels=self.cfg["model"]["input_channels"],
+                include_landcover=self.cfg["data"].get("include_landcover", True),
+            )
 
             # --- Start Training ---
             trainer.fit(model, train_loader, val_loader, ckpt_path=resume_ckpt)
@@ -589,7 +606,7 @@ class ARCEMEPipeline:
                     "best_score": best_score,
                     "best_checkpoint": checkpoint_callback.best_model_path,
                     "best_epoch": self._get_checkpoint_epoch(
-                        checkpoint_callback.best_model_path   # here the epoch is saved, to derive median best cv epoch for the final refit
+                        checkpoint_callback.best_model_path  # here the epoch is saved, to derive median best cv epoch for the final refit
                     ),
                     "metrics": val_results,
                 }
@@ -625,9 +642,9 @@ class ARCEMEPipeline:
             ]
             if best_epochs:
                 # Epoch indices are zero-based; the number for final refit is therefore: epoch + 1.
-                summary["recommended_final_refit_epochs"] = int(
-                    round(float(np.median(best_epochs)))
-                ) + 1
+                summary["recommended_final_refit_epochs"] = (
+                    int(round(float(np.median(best_epochs)))) + 1
+                )
             summary_path = os.path.join(self.run_dir, "cv_summary.json")
             with open(summary_path, "w") as f:
                 json.dump(summary, f, indent=2)
@@ -680,7 +697,9 @@ class ARCEMEPipeline:
 
         train_files = self.prepare_data()
         if not train_files:
-            raise RuntimeError("No eligible training cubes are available for final refit.")
+            raise RuntimeError(
+                "No eligible training cubes are available for final refit."
+            )
 
         print("\n" + "=" * 60)
         print("🚀 STARTING FINAL REFIT (all eligible training cubes, no validation)")
@@ -691,9 +710,7 @@ class ARCEMEPipeline:
         model = ConvLSTM_Model(self.cfg)
 
         wandb_logger = WandbLogger(
-            project=self.cfg.get("wandb", {}).get(
-                "project", "ARCEME_kNDVI_Prediction"
-            ),
+            project=self.cfg.get("wandb", {}).get("project", "ARCEME_kNDVI_Prediction"),
             name=f"{self.cfg['experiment_name']}_final_refit",
             group=self.cfg["experiment_name"],
             job_type="final_refit",
@@ -717,9 +734,7 @@ class ARCEMEPipeline:
             save_last=True,
         )
         callbacks = [final_checkpoint_callback]
-        if (
-            self.cfg["training"]["optimizer"].get("warmup", {}).get("enabled", False)
-        ):
+        if self.cfg["training"]["optimizer"].get("warmup", {}).get("enabled", False):
             callbacks.insert(0, ConfigWarmupCallback(self.cfg))
 
         trainer = Trainer(
@@ -750,6 +765,7 @@ class ARCEMEPipeline:
             self.v_cfg["era5"],
             self.v_cfg["static"],
             expected_input_channels=self.cfg["model"]["input_channels"],
+            include_landcover=self.cfg["data"].get("include_landcover", True),
         )
         if resume_ckpt:
             print(f"♻️ Resuming final refit from: {resume_ckpt}")

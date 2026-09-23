@@ -69,6 +69,7 @@ class ARCEME_Dataset(Dataset):
         self.s1_vars = s1_vars or []
         self.era5_vars = era5_vars or []
         self.static_vars = static_vars or []
+        self.include_landcover = bool(self.cfg["data"].get("include_landcover", True))
 
         # Cube Height and Width
         self.h = 1000
@@ -510,12 +511,16 @@ class ARCEME_Dataset(Dataset):
         # x_s2: (C_s2, T_ctx, H, W)  -- C_s2 will be in the order how I passed the list self.s2_var (Ensure target is at first position!)
         x_s2 = torch.from_numpy(ds_ctx[self.s2_vars].to_array().values).float()
 
-        # Extract only the predictor vars (excluded kNDVI which is the target) for the S2 mask
+        # Extract only the predictor vars (excluding kNDVI (the target)) for the S2 mask
         s2_vars_mask = [var for var in self.s2_vars if var != "kNDVI"]
-        x_s2_mask = torch.from_numpy(ds_ctx[s2_vars_mask].to_array().values).float()
+        if s2_vars_mask:
+            x_s2_mask = torch.from_numpy(ds_ctx[s2_vars_mask].to_array().values).float()
 
-        # Dynamic S2 mask: 1 if ALL channels are valid (non-NAN) else 0, multiplied by vegetation mask
-        m_s2 = (~torch.isnan(x_s2_mask)).all(dim=0, keepdim=True).float() * is_veg
+            # Dynamic S2 mask: 1 if ALL channels are valid (non-NAN) else 0, multiplied by vegetation mask
+            m_s2 = (~torch.isnan(x_s2_mask)).all(dim=0, keepdim=True).float() * is_veg
+        # If no auxiliary S2 channels are configured, no S2 mask is needed
+        else:
+            m_s2 = None
 
         # Replace NaNs in x_s2 with 0.0 (after creating the mask to avoid losing information about valid pixels)
         x_s2 = torch.nan_to_num(x_s2, nan=0.0)
@@ -623,12 +628,24 @@ class ARCEME_Dataset(Dataset):
         # 8. LANDCOVER & STATIC FEATURES
         # ======================================================================
         # lc: (T_ctx, H, W) -> lc_onehot: (T_ctx, 12, H, W)
-        lc = torch.from_numpy(ds_ctx["ESA_LC"].values).long()
-        lc_onehot = encode_landcover(lc)  # Shape: (T_ctx, 12, H, W)
-        lc_onehot = lc_onehot.permute(1, 0, 2, 3)  # NOW: (12, T_ctx, 256, 256)
+        # Landcover can be disabled for kNDVI-only autoregressive baseline
+        if self.include_landcover:
+            lc = torch.from_numpy(ds_ctx["ESA_LC"].values).long()
+            lc_onehot = encode_landcover(lc)  # Shape: (T_ctx, 12, H, W)
+            lc_onehot = lc_onehot.permute(1, 0, 2, 3)  # NOW: (12, T_ctx, 256, 256)
+        else:
+            lc_onehot = torch.empty(
+                0, self.context_len, self.patch_size, self.patch_size
+            )
+
         self._check_shape(
             lc_onehot,
-            (12, self.context_len, self.patch_size, self.patch_size),
+            (
+                12 if self.include_landcover else 0,
+                self.context_len,
+                self.patch_size,
+                self.patch_size,
+            ),
             "lc_onehot",
             path,
         )
@@ -694,19 +711,38 @@ class ARCEME_Dataset(Dataset):
         # 2. Features only present in context:
         # the other S2 variables, S1 variables, Masks
         # x_s2[1:, ...]  -> (Remaining_Channels, T_ctx, 256, 256)
+        context_parts = [x_s2[1:, :, :, :]]
         if x_s1 is not None:
-            context_only_features = torch.cat(
-                [x_s2[1:, :, :, :], x_s1, m_kndvi, m_s2, m_s1], dim=0
-            )
-            num_mask_channels = 3  # m_kndvi, m_s2_rest, m_s1
-        else:
-            context_only_features = torch.cat([x_s2[1:, :, :, :], m_kndvi, m_s2], dim=0)
-            num_mask_channels = 2  # m_kndvi, m_s2_rest
+            context_parts.append(x_s1)
+
+        context_parts.append(m_kndvi)
+
+        if m_s2 is not None:
+            context_parts.append(m_s2)
+
+        if m_s1 is not None:
+            context_parts.append(m_s1)
+
+        context_only_features = torch.cat(context_parts, dim=0)
+
+        num_mask_channels = (
+            1 + int(m_s2 is not None) + int(m_s1 is not None)  # kNDVI mask
+        )
 
         # 3. Final Stack:
         x_context = torch.cat([shared_features, context_only_features], dim=0).permute(
             1, 0, 2, 3
         )
+        # Future static featues (optional LC and statics)
+        if self.include_landcover:
+            lc_fut = torch.from_numpy(ds_target["ESA_LC"].values).long()
+            lc_fut_onehot = encode_landcover(lc_fut).permute(
+                1, 0, 2, 3
+            )  # (12, T_target, H, W)
+        else:
+            lc_fut_onehot = torch.empty(
+                (0, self.target_len, self.patch_size, self.patch_size)
+            )
         # Final Shape x_context: (T_ctx, C_total, 256, 256)
         expected_channels = (
             1  # kNDVI at first position,
@@ -764,11 +800,6 @@ class ARCEME_Dataset(Dataset):
             path,
         )
 
-        # Future Static (One-Hot LC + DEM + is_veg)
-        lc_fut = torch.from_numpy(ds_target["ESA_LC"].values).long()
-        lc_fut_onehot = encode_landcover(lc_fut).permute(
-            1, 0, 2, 3
-        )  # (12, T_target, H, W)
         if len(self.static_vars) > 0:
             x_stat_fut = torch.from_numpy(
                 ds_target[self.static_vars].to_array().values
@@ -834,7 +865,7 @@ class ARCEME_Dataset(Dataset):
             path,
         )
 
-        # Spatial denominator for cube-wise validation coverage. 
+        # Spatial denominator for cube-wise validation coverage.
         eligible_veg = is_veg_target.bool().any(dim=0)
 
         # Training samples must carry supervision. Validation/test tiles remain
@@ -928,30 +959,31 @@ class ARCEME_Dataset(Dataset):
                 ctx_era5_sample, orig_era5_sample
             ), "ERA5 im Context ist falsch positioniert!"
 
-        # 2. Check: Static Alignment (z.B. DEM)
-        # DEM ist die erste Variable in self.static_vars
+        # 2. Check: Static Alignment (if static inputs are provided)
         # Position in x_context: 1 (kNDVI) + len(era5) + 12 (OneHot) + 0 (DEM)
-        dem_idx_ctx = 1 + len(self.era5_vars) + 12
-        dem_idx_fut = 1 + len(self.era5_vars) + 12
+        if self.static_vars:
+            lc_channels = 12 if self.include_landcover else 0
+            dem_idx_ctx = 1 + len(self.era5_vars) + lc_channels
+            dem_idx_fut = 1 + len(self.era5_vars) + lc_channels
 
-        ctx_dem_sample = x_context[0, dem_idx_ctx, rand_y, rand_x]
-        fut_dem_sample = x_future_feat[0, dem_idx_fut, rand_y, rand_x]
+            ctx_dem_sample = x_context[0, dem_idx_ctx, rand_y, rand_x]
+            fut_dem_sample = x_future_feat[0, dem_idx_fut, rand_y, rand_x]
 
-        assert torch.allclose(
-            ctx_dem_sample, fut_dem_sample
-        ), f"Statics mismatch! Context Index {dem_idx_ctx} vs Future Index {dem_idx_fut}"
+            assert torch.allclose(
+                ctx_dem_sample, fut_dem_sample
+            ), f"Statics mismatch! Context Index {dem_idx_ctx} vs Future Index {dem_idx_fut}"
 
-        # 3. Check: LC One-Hot (Klasse 0)
-        # Liegt direkt nach ERA5
-        lc_idx_ctx = 1 + len(self.era5_vars)
-        lc_idx_fut = 1 + len(self.era5_vars)
+        # 3. Check: LC One-Hot alignment (including auxiliary class 0) - if landocver provided
+        if self.include_landcover:
+            lc_idx_ctx = 1 + len(self.era5_vars)
+            lc_idx_fut = 1 + len(self.era5_vars)
 
-        ctx_lc_sample = x_context[0, lc_idx_ctx, rand_y, rand_x]
-        fut_lc_sample = x_future_feat[0, lc_idx_fut, rand_y, rand_x]
+            ctx_lc_sample = x_context[0, lc_idx_ctx, rand_y, rand_x]
+            fut_lc_sample = x_future_feat[0, lc_idx_fut, rand_y, rand_x]
 
-        assert torch.allclose(
-            ctx_lc_sample, fut_lc_sample
-        ), "Landcover One-Hot Alignment fehlerhaft!"
+            assert torch.allclose(
+                ctx_lc_sample, fut_lc_sample
+            ), "Landcover One-Hot Alignment fehlerhaft!"
 
         # 4. Check: kNDVI Consistency
         # kNDVI im Context (Index 0) muss dem letzten Frame der Baseline entsprechen
