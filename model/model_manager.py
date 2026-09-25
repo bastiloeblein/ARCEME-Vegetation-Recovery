@@ -24,6 +24,7 @@ if str(ROOT_DIR) not in sys.path:
 from model.ConvLSTM_model import ConvLSTM_Model
 from model.dataset import ARCEME_Dataset, get_val_tiles_auto
 from model.cv_splits import (
+    create_chronological_holdout,
     create_spacetime_folds,
 )
 from model.utils import print_channel_info
@@ -126,6 +127,28 @@ class ARCEMEPipeline:
         # final refit without validation loader.
         self.final_refit_cfg = self.cfg["training"].get("final_refit", {})
         self.is_final_refit = bool(self.final_refit_cfg.get("enabled", False))
+        self.temporal_holdout_cfg = self.cfg["cross_validation"].get(
+            "temporal_holdout", {}
+        )
+        self.is_temporal_holdout = (
+            self.cfg["cross_validation"].get("enabled", False)
+            and self.cv_type == "temporal_holdout"
+        )
+        if self.is_temporal_holdout and self.k_folds != 1:
+            raise ValueError(
+                "cross_validation.k_folds must be 1 for temporal_holdout."
+            )
+        if self.is_temporal_holdout:
+            temporal_epochs = self.temporal_holdout_cfg.get("epochs")
+            if (
+                isinstance(temporal_epochs, bool)
+                or not isinstance(temporal_epochs, int)
+                or temporal_epochs < 1
+            ):
+                raise ValueError(
+                    "cross_validation.temporal_holdout.epochs must be a positive "
+                    "integer fixed before the out-of-time experiment."
+                )
 
         self._calculate_dynamic_channels()
 
@@ -196,6 +219,31 @@ class ARCEMEPipeline:
             )
             with open(split_log_path, "r") as f:
                 split_info = json.load(f)
+
+            if self.is_temporal_holdout:
+                metadata = split_info.get("metadata", {})
+                if metadata.get("split_type") != "temporal_holdout":
+                    raise ValueError(
+                        "The existing cv_splits.json is not a temporal-holdout "
+                        "manifest. Start a fresh run or provide the correct manifest."
+                    )
+                expected_train_end = int(
+                    self.temporal_holdout_cfg["train_end_year"]
+                )
+                expected_validation_years = sorted(
+                    int(year)
+                    for year in self.temporal_holdout_cfg["validation_years"]
+                )
+                if (
+                    metadata.get("train_end_year") != expected_train_end
+                    or metadata.get("validation_years")
+                    != expected_validation_years
+                ):
+                    raise ValueError(
+                        "The year definition in the existing temporal-holdout "
+                        "manifest differs from the current configuration. Start "
+                        "a fresh run instead of reusing this manifest."
+                    )
 
             all_folds = []
             for fold_idx in range(self.k_folds):
@@ -280,13 +328,23 @@ class ARCEMEPipeline:
             )
             self.k_folds = 1
 
+        elif self.cv_type == "temporal_holdout":
+            print("\n✂️ Creating chronological out-of-time holdout...")
+            cv_data = create_chronological_holdout(
+                valid_zarrs_paths,
+                self.train_test_split_csv,
+                train_end_year=self.temporal_holdout_cfg["train_end_year"],
+                validation_years=self.temporal_holdout_cfg["validation_years"],
+            )
+            self.k_folds = 1
+
         else:
             raise ValueError(f"Unknown CV type: {self.cv_type}")
 
         all_folds = [(f["train_files"], f["val_files"]) for f in cv_data["folds"]]
 
         # --- Log Split Info ---
-        split_info = {}
+        split_info = {"metadata": cv_data.get("metadata", {})}
         for fold_idx, (train_files, val_files) in enumerate(all_folds):
             split_info[f"fold_{fold_idx}"] = {
                 "train_files": [str(f) for f in train_files],
@@ -424,6 +482,15 @@ class ARCEMEPipeline:
             if final_checkpoint and os.path.exists(final_checkpoint):
                 return final_checkpoint
 
+        temporal_summary_path = os.path.join(
+            self.run_dir, "temporal_holdout_summary.json"
+        )
+        if os.path.exists(temporal_summary_path):
+            with open(temporal_summary_path, "r") as f:
+                temporal_checkpoint = json.load(f).get("checkpoint")
+            if temporal_checkpoint and os.path.exists(temporal_checkpoint):
+                return temporal_checkpoint
+
         # Check if the summary file exists (means training finished cleanly)
         summary_path = os.path.join(self.run_dir, "cv_summary.json")
         if os.path.exists(summary_path):
@@ -472,12 +539,28 @@ class ARCEMEPipeline:
 
         fold_results = []
         v_cfg = self.cfg["data"]["variables"]
+        fixed_temporal_epochs = (
+            self.temporal_holdout_cfg["epochs"]
+            if self.is_temporal_holdout
+            else None
+        )
+
+        if self.is_temporal_holdout and resume_from_type != "last":
+            raise ValueError(
+                "Temporal holdout can only resume from the last checkpoint; use "
+                "--resume_type last."
+            )
 
         for fold_idx in range(start_fold, self.k_folds):
             train_files, val_files = all_folds[fold_idx]
 
             print("\n" + "=" * 50)
-            print(f"🚀 STARTING FOLD {fold_idx} (LLTO-CV)")
+            run_label = (
+                "CHRONOLOGICAL HOLDOUT"
+                if self.is_temporal_holdout
+                else f"{self.cv_type.upper()}-CV"
+            )
+            print(f"🚀 STARTING FOLD {fold_idx} ({run_label})")
             print(f"With {len(train_files)} train and {len(val_files)} val cubes.")
             print("=" * 50)
 
@@ -527,24 +610,34 @@ class ARCEMEPipeline:
             ckpt_dir = os.path.join(self.run_dir, f"fold_{fold_idx}", "checkpoints")
             monitor_key = self.cfg["training"]["validation"]["monitor"]["metric"]
             monitor_mode = self.cfg["training"]["validation"]["monitor_mode"]
-            filename = f"best-model-{{epoch:02d}}-{{{monitor_key}:.6f}}"
+            if self.is_temporal_holdout:
+                # Later years must not influence training duration, learning-rate
+                # scheduling, early stopping, or checkpoint selection.
+                checkpoint_callback = ModelCheckpoint(
+                    dirpath=ckpt_dir,
+                    filename="temporal-model-{epoch:03d}",
+                    save_top_k=0,
+                    save_last=True,
+                )
+                early_stop = None
+            else:
+                filename = f"best-model-{{epoch:02d}}-{{{monitor_key}:.6f}}"
+                checkpoint_callback = ModelCheckpoint(
+                    dirpath=ckpt_dir,
+                    monitor=monitor_key,
+                    filename=filename,
+                    save_top_k=3,
+                    mode=monitor_mode,
+                    save_last=True,
+                )
 
-            checkpoint_callback = ModelCheckpoint(
-                dirpath=ckpt_dir,
-                monitor=monitor_key,
-                filename=filename,
-                save_top_k=3,
-                mode=monitor_mode,
-                save_last=True,
-            )
-
-            early_stop = EarlyStopping(
-                monitor=monitor_key,
-                patience=self.cfg["training"]["optimizer"]["patience"],
-                mode=monitor_mode,
-                min_delta=0.00,  # Val criteria has to improve by at least this much to reset patience counter
-                strict=True,  # might fail (checkt ob metric überhaupt da ist)
-            )
+                early_stop = EarlyStopping(
+                    monitor=monitor_key,
+                    patience=self.cfg["training"]["optimizer"]["patience"],
+                    mode=monitor_mode,
+                    min_delta=0.00,  # Val criteria has to improve by at least this much to reset patience counter
+                    strict=True,  # might fail (checkt ob metric überhaupt da ist)
+                )
 
             # Define Warmup Callback
             if (
@@ -553,9 +646,11 @@ class ARCEMEPipeline:
                 .get("enabled", False)
             ):
                 warmup_callback = ConfigWarmupCallback(self.cfg)
-                callbacks = [warmup_callback, checkpoint_callback, early_stop]
+                callbacks = [warmup_callback, checkpoint_callback]
             else:
-                callbacks = [checkpoint_callback, early_stop]
+                callbacks = [checkpoint_callback]
+            if early_stop is not None:
+                callbacks.append(early_stop)
 
             # --- Trainer ---
             trainer = Trainer(
@@ -572,7 +667,11 @@ class ARCEMEPipeline:
                     else "norm"
                 ),
                 check_val_every_n_epoch=1,
-                max_epochs=self.cfg["training"]["max_epochs"],
+                max_epochs=(
+                    fixed_temporal_epochs
+                    if self.is_temporal_holdout
+                    else self.cfg["training"]["max_epochs"]
+                ),
                 accelerator=self.cfg["training"]["accelerator"],
                 devices=self.cfg["training"]["devices"],
                 precision=self.cfg["training"]["precision"],
@@ -591,27 +690,61 @@ class ARCEMEPipeline:
             )
 
             # --- Start Training ---
-            trainer.fit(model, train_loader, val_loader, ckpt_path=resume_ckpt)
+            if self.is_temporal_holdout:
+                trainer.fit(model, train_loader, ckpt_path=resume_ckpt)
+            else:
+                trainer.fit(model, train_loader, val_loader, ckpt_path=resume_ckpt)
 
             # --- VALIDATE & LOG ---
+            evaluation_checkpoint = (
+                checkpoint_callback.last_model_path
+                if self.is_temporal_holdout
+                else "best"
+            )
+            if self.is_temporal_holdout and not evaluation_checkpoint:
+                raise RuntimeError(
+                    "Temporal-holdout training finished without a last checkpoint."
+                )
             val_results = trainer.validate(
-                model, dataloaders=val_loader, ckpt_path="best"
+                model, dataloaders=val_loader, ckpt_path=evaluation_checkpoint
             )[0]
             best_score = val_results.get(monitor_key, float("nan"))
-
-            # Save stats of best model for this fold
-            fold_results.append(
-                {
-                    "fold": fold_idx,
-                    "best_score": best_score,
-                    "best_checkpoint": checkpoint_callback.best_model_path,
-                    "best_epoch": self._get_checkpoint_epoch(
-                        checkpoint_callback.best_model_path  # here the epoch is saved, to derive median best cv epoch for the final refit
-                    ),
-                    "metrics": val_results,
-                }
+            stored_checkpoint = (
+                checkpoint_callback.last_model_path
+                if self.is_temporal_holdout
+                else checkpoint_callback.best_model_path
             )
-            print(f"\n✅ Fold {fold_idx} done | Best Val Score: {best_score:.4f}")
+            stored_epoch = (
+                fixed_temporal_epochs - 1
+                if self.is_temporal_holdout
+                else self._get_checkpoint_epoch(checkpoint_callback.best_model_path)
+            )
+
+            if self.is_temporal_holdout:
+                fold_results.append(
+                    {
+                        "fold": fold_idx,
+                        "final_score": best_score,
+                        "checkpoint": stored_checkpoint,
+                        "epoch": stored_epoch,
+                        "metrics": val_results,
+                    }
+                )
+                print(
+                    f"\n✅ Temporal holdout complete | Final score: {best_score:.4f}"
+                )
+            else:
+                # Save stats of best model for this fold
+                fold_results.append(
+                    {
+                        "fold": fold_idx,
+                        "best_score": best_score,
+                        "best_checkpoint": stored_checkpoint,
+                        "best_epoch": stored_epoch,
+                        "metrics": val_results,
+                    }
+                )
+                print(f"\n✅ Fold {fold_idx} done | Best Val Score: {best_score:.4f}")
 
             # Cleanup RAM/VRAM before next fold
             del model, trainer, train_loader, val_loader
@@ -620,6 +753,36 @@ class ARCEMEPipeline:
 
         # --- Final Summary ---
         if fold_results:
+            if self.is_temporal_holdout:
+                temporal_result = fold_results[0]
+                train_files, val_files = all_folds[0]
+                summary = {
+                    "protocol": "fixed_epoch_temporal_holdout",
+                    "train_end_year": int(
+                        self.temporal_holdout_cfg["train_end_year"]
+                    ),
+                    "validation_years": sorted(
+                        int(year)
+                        for year in self.temporal_holdout_cfg["validation_years"]
+                    ),
+                    "num_train": len(train_files),
+                    "num_validation": len(val_files),
+                    "epochs": fixed_temporal_epochs,
+                    "final_score": temporal_result["final_score"],
+                    "checkpoint": temporal_result["checkpoint"],
+                    "metrics": temporal_result["metrics"],
+                    "validation_used_during_training": False,
+                    "early_stopping": False,
+                    "validation_dependent_scheduler": False,
+                }
+                summary_path = os.path.join(
+                    self.run_dir, "temporal_holdout_summary.json"
+                )
+                with open(summary_path, "w") as f:
+                    json.dump(summary, f, indent=2)
+                print(f"\n📊 Temporal-holdout summary saved: {summary_path}")
+                return summary
+
             is_min = self.cfg["training"]["validation"]["monitor_mode"] == "min"
             best_fold = (
                 min(fold_results, key=lambda x: x["best_score"])
@@ -634,6 +797,11 @@ class ARCEMEPipeline:
                     np.mean([r["best_score"] for r in fold_results])
                 ),
                 "std_val_score": float(np.std([r["best_score"] for r in fold_results])),
+                "protocol": (
+                    "fixed_epoch_temporal_holdout"
+                    if self.is_temporal_holdout
+                    else "cross_validation"
+                ),
             }
             best_epochs = [
                 result["best_epoch"]

@@ -989,8 +989,15 @@ class ConvLSTM_Model(pl.LightningModule):
             lr=self.cfg["training"]["optimizer"]["start_learn_rate"],
         )
 
-        if self.cfg["training"].get("final_refit", {}).get("enabled", False):
-            # Final refit has no validation, so we return only the optimizer without a scheduler.
+        cv_cfg = self.cfg.get("cross_validation", {})
+        temporal_holdout = cv_cfg.get("enabled", False) and cv_cfg.get("type") == (
+            "temporal_holdout"
+        )
+        if (
+            self.cfg["training"].get("final_refit", {}).get("enabled", False)
+            or temporal_holdout
+        ):
+            # Fixed-epoch fits do not use validation-dependent LR scheduling.
             return optimizer
 
         # Monitor metric that should defines validation performance

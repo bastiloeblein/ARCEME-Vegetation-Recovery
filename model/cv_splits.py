@@ -7,6 +7,136 @@ from matplotlib.patches import Patch
 from sklearn.model_selection import GroupKFold
 import random
 import os
+from pathlib import Path
+
+
+def _cube_id_from_path(path):
+    """Return the ARCEME event ID encoded in a processed cube path."""
+    name = Path(path).name
+    if name.endswith(".zarr"):
+        name = name[: -len(".zarr")]
+    if name.endswith("_postprocessed"):
+        name = name[: -len("_postprocessed")]
+    return name
+
+
+def create_chronological_holdout(
+    valid_zarrs_paths,
+    df_path,
+    train_end_year,
+    validation_years,
+):
+    """Create one chronological train/validation split from eligible cubes.
+
+    The caller is responsible for applying cube-level quality filtering before
+    passing ``valid_zarrs_paths``. Every eligible cube must be assigned exactly
+    once, and all validation years must be later than the training years.
+    """
+    paths = [str(path) for path in valid_zarrs_paths]
+    if not paths:
+        raise ValueError("No quality-filtered cubes were supplied.")
+    if len(paths) != len(set(paths)):
+        raise ValueError("valid_zarrs_paths contains duplicate paths.")
+
+    train_end_year = int(train_end_year)
+    validation_years = sorted({int(year) for year in validation_years})
+    if not validation_years:
+        raise ValueError("validation_years must contain at least one year.")
+    if train_end_year >= min(validation_years):
+        raise ValueError(
+            "Temporal holdout is not chronological: every validation year must "
+            "be later than train_end_year."
+        )
+
+    metadata = pd.read_csv(df_path)
+    required_columns = {"DisNo.", "year"}
+    missing_columns = required_columns.difference(metadata.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Metadata is missing required columns: {sorted(missing_columns)}"
+        )
+    if metadata["DisNo."].duplicated().any():
+        duplicates = metadata.loc[
+            metadata["DisNo."].duplicated(keep=False), "DisNo."
+        ].astype(str)
+        raise ValueError(
+            "Metadata contains duplicate event IDs; first duplicate: "
+            f"{sorted(duplicates)[0]}"
+        )
+
+    metadata = metadata[["DisNo.", "year"]].copy()
+    metadata["DisNo."] = metadata["DisNo."].astype(str)
+    metadata["year"] = pd.to_numeric(metadata["year"], errors="raise").astype(int)
+
+    cube_ids = [_cube_id_from_path(path) for path in paths]
+    if len(cube_ids) != len(set(cube_ids)):
+        raise ValueError("Multiple cube paths resolve to the same ARCEME event ID.")
+
+    path_table = pd.DataFrame({"DisNo.": cube_ids, "full_path": paths})
+    split_table = path_table.merge(
+        metadata,
+        on="DisNo.",
+        how="left",
+        validate="one_to_one",
+        indicator=True,
+    )
+    missing_ids = split_table.loc[split_table["_merge"] != "both", "DisNo."].tolist()
+    if missing_ids:
+        raise ValueError(
+            "No metadata row was found for quality-filtered cube(s): "
+            + ", ".join(sorted(missing_ids)[:5])
+        )
+    split_table = split_table.drop(columns="_merge")
+
+    train_mask = split_table["year"] <= train_end_year
+    validation_mask = split_table["year"].isin(validation_years)
+    unassigned = split_table.loc[~(train_mask | validation_mask), ["DisNo.", "year"]]
+    if not unassigned.empty:
+        preview = ", ".join(
+            f"{row['DisNo.']} ({row['year']})"
+            for _, row in unassigned.sort_values("DisNo.").head(5).iterrows()
+        )
+        raise ValueError(
+            "Some quality-filtered cubes fall outside the configured temporal "
+            f"split: {preview}"
+        )
+
+    train_table = split_table.loc[train_mask].sort_values("full_path")
+    validation_table = split_table.loc[validation_mask].sort_values("full_path")
+    if train_table.empty:
+        raise ValueError("The chronological training subset is empty.")
+    if validation_table.empty:
+        raise ValueError("The chronological validation subset is empty.")
+    if train_table["year"].max() >= validation_table["year"].min():
+        raise ValueError("Training and validation years are not strictly chronological.")
+
+    train_files = train_table["full_path"].tolist()
+    validation_files = validation_table["full_path"].tolist()
+    year_counts = split_table["year"].value_counts().sort_index()
+
+    return {
+        "folds": [
+            {
+                "fold": 0,
+                "num_train": len(train_files),
+                "num_val": len(validation_files),
+                "train_files": train_files,
+                "val_files": validation_files,
+            }
+        ],
+        "metadata": {
+            "split_type": "temporal_holdout",
+            "total_cubes": len(split_table),
+            "train_end_year": train_end_year,
+            "train_years": sorted(train_table["year"].unique().astype(int).tolist()),
+            "validation_years": validation_years,
+            "num_train": len(train_files),
+            "num_val": len(validation_files),
+            "year_counts": {
+                str(int(year)): int(count) for year, count in year_counts.items()
+            },
+        },
+    }
 
 
 def create_spacetime_folds(

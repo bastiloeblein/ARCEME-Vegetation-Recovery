@@ -52,4 +52,15 @@ class ConfigWarmupCallback(pl.Callback):
             print(
                 f"\n🚀 Warmup ended! Starting normal Training with target LR {self.target_lr:.6f}."
             )
-            print("From here on, the Plateau Scheduler takes over.")
+            uses_plateau_scheduler = not (
+                self.cfg["training"].get("final_refit", {}).get("enabled", False)
+                or (
+                    self.cfg.get("cross_validation", {}).get("enabled", False)
+                    and self.cfg.get("cross_validation", {}).get("type")
+                    == "temporal_holdout"
+                )
+            )
+            if uses_plateau_scheduler:
+                print("From here on, the Plateau Scheduler takes over.")
+            else:
+                print("The target learning rate remains fixed from here on.")

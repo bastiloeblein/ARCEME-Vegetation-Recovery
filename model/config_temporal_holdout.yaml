@@ -1,0 +1,116 @@
+experiment_name: "TemporalHoldout_SGEDConvLSTM_RGBI_kNDVI"
+
+wandb:
+  project: "ARCEME-Vegetation-Dynamics-Prediction-Final"
+
+data:
+  train_data_dir: "/net/projects/arceme/vegetation_recovery_prediction/data/final_new/train"
+  train_test_split: "data_processing/data/train_test_split.csv"
+  test_data_dir: "/net/projects/arceme/vegetation_recovery_prediction/data/final_new/test"
+  quality_check:
+    ctx_min_valid_ratio: 0.05
+    ctx_required_fraction: 0.25
+    ctx_min_valid_overall: 0.1
+    tgt_min_valid_ratio: 0.05
+    tgt_min_timesteps: 1
+    patch_max_retries: 15
+    cube_resample_attempts: 4
+  patch_size: 128
+  context_length: 30
+  target_length: 6
+  variables:
+    s2:
+      - "kNDVI"
+      - "B02"
+      - "B03"
+      - "B04"
+      - "B8A"
+    s1:
+      - "vv"
+      - "vh"
+    era5:
+      - "t2m_mean"
+      - "t2m_min"
+      - "t2m_max"
+      - "tp_rollingmax_mean"
+      - "pei_30_mean"
+      - "pei_90_mean"
+    static:
+      - "COP_DEM"
+  data_loader:
+    num_workers: 10
+
+training:
+  seed: 2026
+  optimizer:
+    name: "adamW"
+    start_learn_rate: 0.0001
+    warmup:
+      enabled: true
+      epochs: 5
+    lr_factor: 0.50
+    lr_threshold: 0.0001
+    scheduler_patience: 5
+    min_lr: 0.000001
+    patience: 20
+  gradient_clipping:
+    enabled: false
+    value: 1.0
+    algorithm: "norm"
+  batch_size: 8
+  accumulate_grad_batches: 1
+  max_epochs: 23
+  accelerator: "gpu"
+  devices: 1
+  precision: "16-mixed"
+  use_augmentation: true
+  final_refit:
+    enabled: false
+    epochs: null
+    source_cv_run: null
+  training_loss:
+    loss_function: "l1"
+    alpha: 1
+    beta: 0
+    gamma: 0
+  scaling_factor: 1
+  validation:
+    monitor:
+      metric: "val/grand_mean_macro/NNSE"
+    monitor_mode: "max"
+    min_valid_target_coverage: 0.15
+    min_valid_target_count: 1000
+    min_target_variance: 0.000001
+    log_timestep_metrics: false
+
+model:
+  model_type: "SGEDConvLSTM"
+  checkpoint_path: null
+  output_channels: 1
+  hidden_channels:
+    - 96
+    - 96
+    - 96
+  n_layers: 3
+  kernel: 5
+  dilation_rate: 1
+  memory_kernel: 5
+  peephole: false
+  baseline: "last_frame"
+  dropout_prob: 0.3
+  layer_norm: false
+
+cross_validation:
+  enabled: true
+  k_folds: 1
+  type: "temporal_holdout"
+  temporal_holdout:
+    train_end_year: 2021
+    validation_years:
+      - 2022
+      - 2023
+    epochs: 23
+
+testing:
+  save_tensors: true
+  save_metrics: true
