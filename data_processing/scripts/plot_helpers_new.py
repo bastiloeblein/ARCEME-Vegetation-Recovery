@@ -215,12 +215,17 @@ def plot_rgb(
         return error_fig(f"Timestep {timestep} out of range")
 
     def stretch_arr(band):
-        arr = band.compute().astype("float32")
-        p2, p98 = np.percentile(arr, stretch_pct)
+        arr = np.asarray(band.compute(), dtype="float32")
+        finite = np.isfinite(arr)
+        if not finite.any():
+            return np.full_like(arr, np.nan)
+        p2, p98 = np.percentile(arr[finite], stretch_pct)
         diff = p98 - p2
         if diff == 0:
             diff = 1.0
-        return np.clip((arr - p2) / diff, 0, 1)
+        stretched = np.clip((arr - p2) / diff, 0, 1)
+        stretched[~finite] = np.nan
+        return stretched
 
     # 2. Subset & RGB Creation
     subset = ds.isel({time_dim: timestep})
