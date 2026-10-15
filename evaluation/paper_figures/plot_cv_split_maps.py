@@ -17,6 +17,10 @@ import argparse
 import json
 import re
 from pathlib import Path
+import sys
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
 
 import pandas as pd
 
@@ -81,11 +85,17 @@ def load_split_membership(split_path: Path, metadata: pd.DataFrame) -> pd.DataFr
 
         overlap = sorted(set(train_ids).intersection(val_ids))
         if overlap:
-            raise ValueError(f"Fold {fold} contains train/validation overlap: {overlap[:5]}")
+            raise ValueError(
+                f"Fold {fold} contains train/validation overlap: {overlap[:5]}"
+            )
         if len(train_ids) != int(split["num_train"]):
-            raise ValueError(f"Stored train count does not match train files in fold {fold}")
+            raise ValueError(
+                f"Stored train count does not match train files in fold {fold}"
+            )
         if len(val_ids) != int(split["num_val"]):
-            raise ValueError(f"Stored validation count does not match validation files in fold {fold}")
+            raise ValueError(
+                f"Stored validation count does not match validation files in fold {fold}"
+            )
 
         for subset, cube_ids in (("train", train_ids), ("validation", val_ids)):
             missing = sorted(set(cube_ids).difference(metadata_by_id.index))
@@ -186,12 +196,24 @@ def plot_fold_maps(membership: pd.DataFrame, output_path: Path, dpi: int) -> Non
 
     legend_handles = [
         Line2D(
-            [0], [0], marker="o", color="none", markerfacecolor=train_colour,
-            markeredgecolor="white", markersize=7, label="Training cubes"
+            [0],
+            [0],
+            marker="o",
+            color="none",
+            markerfacecolor=train_colour,
+            markeredgecolor="white",
+            markersize=7,
+            label="Training cubes",
         ),
         Line2D(
-            [0], [0], marker="o", color="none", markerfacecolor=validation_colour,
-            markeredgecolor="#4A1020", markersize=7, label="Validation cubes"
+            [0],
+            [0],
+            marker="o",
+            color="none",
+            markerfacecolor=validation_colour,
+            markeredgecolor="#4A1020",
+            markersize=7,
+            label="Validation cubes",
         ),
     ]
     figure.legend(
@@ -264,11 +286,7 @@ def main() -> None:
     if not metadata_path.exists():
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
 
-    output_dir = (
-        Path(args.output_dir).expanduser().resolve()
-        if args.output_dir
-        else run_dir / "results" / "paper_figures" / "cv_splits"
-    )
+    output_dir = REPO / "evaluation" / "paper_figures" / "cv_splits"
     membership = load_split_membership(split_path, load_metadata(metadata_path))
     summary = summarise_folds(membership)
 

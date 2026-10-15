@@ -468,7 +468,11 @@ def main() -> None:
         # output_dir = args.output_dir or REPO_ROOT / "evaluation" / "paper_figures" / "output" / "holdout_anaylsis" /  "plots" / "qualitative"
         output_dir = (
             args.output_dir
-            or REPO_ROOT / "evaluation" / "paper_figures" / "final_plots"
+            or REPO_ROOT
+            / "evaluation"
+            / "paper_figures"
+            / "final_plots"
+            / "holdout_forecast"
         )
         output_dir = output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
