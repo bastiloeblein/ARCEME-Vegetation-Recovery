@@ -603,8 +603,6 @@ class ConvLSTM_Model(pl.LightningModule):
             # Calculate Macro Metrics for this specific Cube (aggregated over all T)
             # (Total squared error across all timesteps / Total valid pixels across all timesteps)
             # Pixel based weithing (each pixel has same weight) - if one timestep has only few pixels, it will not bias the overall metric for the cube
-            # NEW: Use a vegetation-relative denominator: every vegetated
-            # pixel can contribute at each target timestep.
             total_cube_pixels = int(cube_ts_pixels.sum().item())
             eligible_veg_pixels = int(eligible_veg_cube.sum().item())
             possible_target_pixel_times = t_fut * eligible_veg_pixels
